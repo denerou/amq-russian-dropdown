@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         AMQ Russian DropDown
-// @version      1.9.3
+// @version      1.9.7
 // @description  
 // @match        https://animemusicquiz.com/*
 // @match        https://www.animemusicquiz.com/*
@@ -45,80 +45,13 @@
     }
   };
 
-  const SCROLLBAR_CSS = `
-    #amqRussianScrollbarTrack {
-      position: absolute;
-      z-index: 3;
-      top: 0;
-      right: 0;
-      bottom: 0;
-      width: 8px;
-      background: transparent;
-      pointer-events: none;
-    }
-
-    #amqRussianScrollbarThumb {
-      position: absolute;
-      top: 0;
-      right: 1px;
-      width: 6px;
-      min-height: 20px;
-      background: rgba(255, 255, 255, 0.4);
-      border-radius: 5px;
-      pointer-events: auto;
-      cursor: pointer;
-      transform: scaleX(1);
-      transform-origin: right center;
-      transition: transform 120ms ease, background-color 120ms ease;
-    }
-
-    #amqRussianScrollbarThumb:hover,
-    #amqRussianScrollbarThumb.is-dragging {
-      background: color-mix(
-        in srgb,
-        var(--amq-russian-accent) 40%,
-        transparent
-      );
-      transform: scaleX(1.5);
-    }
-
-    #amqRussianListViewport {
-      scrollbar-width: none;
-      -ms-overflow-style: none;
-    }
-
-    #amqRussianListViewport::-webkit-scrollbar {
-      display: none;
-      width: 0;
-      height: 0;
-    }
-  `;
-
-  const scrollbarStyle = document.createElement("style");
-  scrollbarStyle.textContent = SCROLLBAR_CSS;
-  document.head.appendChild(scrollbarStyle);
-
   const panel = document.createElement("div");
   panel.id = "amqRussianTitlePanel";
-  panel.style.cssText = [
-    "display:none",
-    "position:absolute",
-    "z-index:999999",
-    "border:0",
-    "border-radius:8px",
-    "box-shadow:0 0 10px 2px #000",
-    "overflow:hidden"
-  ].join(";");
+  panel.className = "amqRussianTitlePanel";
 
   const viewport = document.createElement("div");
   viewport.id = "amqRussianListViewport";
-  viewport.style.cssText = [
-    "position:relative",
-    "max-height:260px",
-    "overflow-y:auto",
-    "overflow-x:hidden",
-    "overscroll-behavior:contain"
-  ].join(";");
+  viewport.className = "amqRussianListViewport";
 
   const scrollbarTrack = document.createElement("div");
   scrollbarTrack.id = "amqRussianScrollbarTrack";
@@ -478,30 +411,13 @@
       throw new Error(`API did not confirm saving MAL ID ${malId}`);
     }
     confirmedDiscoveredMalIds.add(malId);
-    if (response.inserted) {
-      console.info(
-        `[AMQ Russian DropDown] Added "${russianTitle}" to the title database (MAL ${malId}).`
-      );
-    }
   }
 
   function showSaveErrorToast() {
     if (!saveErrorToast) {
       saveErrorToast = document.createElement("div");
       saveErrorToast.setAttribute("role", "alert");
-      saveErrorToast.style.cssText = [
-        "position:fixed",
-        "right:16px",
-        "bottom:16px",
-        "z-index:1000000",
-        "max-width:360px",
-        "padding:10px 14px",
-        "border-radius:6px",
-        "background:rgba(120,20,20,.95)",
-        "color:#fff",
-        "font:14px/1.4 sans-serif",
-        "box-shadow:0 2px 10px rgba(0,0,0,.4)"
-      ].join(";");
+      saveErrorToast.className = "amqRussianSaveErrorToast";
       document.body.appendChild(saveErrorToast);
     }
 
@@ -842,51 +758,17 @@
     tooltip = document.createElement("div");
     tooltip.className = tooltipClass;
     tooltip.setAttribute("role", "status");
-    tooltip.style.cssText = [
-      "position:absolute",
-      "left:-253px",
-      "top:50%",
-      "transform:translateY(-50%)",
-      "box-sizing:border-box",
-      "width:243px",
-      "min-height:79px",
-      "padding:12px 22px",
-      "display:none",
-      "align-items:center",
-      "justify-content:center",
-      "border-radius:8px",
-      "background:var(--primaryColor, var(--primarycolor, rgba(0,0,0,.9)))",
-      "color:#f0f0f0",
-      "font-size:16px",
-      "font-weight:400",
-      "line-height:1.35",
-      "text-align:center",
-      "white-space:normal",
-      "overflow-wrap:anywhere",
-      "z-index:1000",
-      "box-shadow:0 2px 8px rgba(0,0,0,.25)"
-    ].join(";");
 
     const content = document.createElement("span");
     content.className = "amqShikimoriRussianTitleText";
 
     const arrow = document.createElement("div");
+    arrow.className = "amqShikimoriRussianTitleArrow";
     arrow.setAttribute("aria-hidden", "true");
-    arrow.style.cssText = [
-      "position:absolute",
-      "right:-10px",
-      "top:50%",
-      "transform:translateY(-50%)",
-      "width:0",
-      "height:0",
-      "border-top:11px solid transparent",
-      "border-bottom:11px solid transparent",
-      "border-left:10px solid var(--primaryColor, var(--primarycolor, rgba(0,0,0,.9)))"
-    ].join(";");
     tooltip.append(content, arrow);
 
     if (getComputedStyle(container).position === "static") {
-      container.style.position = "relative";
+      container.classList.add("amqRussianPositioned");
     }
     container.appendChild(tooltip);
     container.addEventListener("mouseenter", () => {
@@ -949,7 +831,7 @@
     updateColors(input);
 
     if (getComputedStyle(wrapper).position === "static") {
-      wrapper.style.position = "relative";
+      wrapper.classList.add("amqRussianPositioned");
     }
 
     if (panel.parentElement !== wrapper) {
@@ -960,7 +842,6 @@
     panel.style.top = `${input.offsetHeight}px`;
     panel.style.width = `${wrapper.getBoundingClientRect().width}px`;
     panel.style.font = getComputedStyle(input).font;
-    panel.style.fontWeight = "400";
     panel.style.backgroundColor = COLORS.current.panelBackground;
     panel.style.color = COLORS.current.textColor;
 
@@ -1008,15 +889,16 @@
     viewport.replaceChildren();
 
     const row = document.createElement("div");
-    row.style.cssText = "padding:9px;text-align:center;font-weight:400";
+    row.className = "amqRussianStatusRow";
     viewport.appendChild(row);
 
-    let dotCount = 1;
-    row.textContent = ".".repeat(dotCount);
+    const frames = ["...", ".", ".."];
+    let frameIndex = 0;
+    row.textContent = frames[frameIndex];
 
     statusTimer = setInterval(() => {
-      dotCount = (dotCount % 3) + 1;
-      row.textContent = ".".repeat(dotCount);
+      frameIndex = (frameIndex + 1) % frames.length;
+      row.textContent = frames[frameIndex];
     }, 200);
 
     positionPanel();
@@ -1030,8 +912,7 @@
     viewport.replaceChildren();
 
     const row = document.createElement("div");
-    row.style.cssText =
-      "padding:9px;text-align:center;font-weight:400;white-space:normal";
+    row.className = "amqRussianNoticeRow";
     row.textContent = message;
     viewport.appendChild(row);
 
@@ -1062,8 +943,6 @@
       const match = document.createElement("span");
       match.className = "amqRussianMatch";
       match.textContent = matchResult[0];
-      match.style.color = COLORS.current.accentColor;
-      match.style.fontWeight = "400";
       container.append(match);
       previousIndex = matcher.lastIndex;
 
@@ -1077,7 +956,6 @@
 
   function styleButton(button, state) {
     const matches = button.querySelectorAll(".amqRussianMatch");
-    button.style.fontWeight = "400";
 
     let foreground;
 
@@ -1219,31 +1097,20 @@
     results.forEach((result, index) => {
       const button = document.createElement("button");
       button.type = "button";
+      button.className = "amqRussianResultButton";
       button.dataset.resultIndex = String(index);
       button.setAttribute("aria-selected", "false");
-      button.style.cssText = [
-        "display:block",
-        "width:100%",
-        "min-height:6px",
-        "padding:6px 12px",
-        "text-align:center",
-        "border:0",
-        "cursor:pointer",
-        "font:inherit",
-        "font-weight:400",
-        "line-height:1.35"
-      ].join(";");
 
       const russianTitle = document.createElement("span");
       appendHighlightedText(russianTitle, result.russian, query);
 
       const separator = document.createElement("span");
+      separator.className = "amqRussianResultSeparator";
       separator.textContent = " / ";
-      separator.style.opacity = "0.5";
 
       const amqTitle = document.createElement("span");
+      amqTitle.className = "amqRussianResultAmqTitle";
       amqTitle.textContent = result.amqTitle;
-      amqTitle.style.opacity = "0.5";
 
       button.append(russianTitle, separator, amqTitle);
 
@@ -1311,7 +1178,8 @@
     if (results.length) {
       showResults(results, query);
     } else {
-      showNotice("Совпадений в списке названий AMQ не найдено.");
+      stopStatusAnimation();
+      panel.style.display = "none";
     }
   }
 
@@ -1463,4 +1331,162 @@
       setupShikimoriTitleListener();
     }
   }, 500);
+
+  const SCRIPT_CSS = `
+    #amqRussianTitlePanel {
+      display: none;
+      position: absolute;
+      z-index: 999999;
+      border: 0;
+      border-radius: 8px;
+      box-shadow: 0 0 10px 2px #000;
+      overflow: hidden;
+      font-weight: 400;
+    }
+
+    .amqRussianPositioned {
+      position: relative;
+    }
+
+    #amqRussianListViewport {
+      position: relative;
+      max-height: 260px;
+      overflow-y: auto;
+      overflow-x: hidden;
+      overscroll-behavior: contain;
+      scrollbar-width: none;
+      -ms-overflow-style: none;
+    }
+
+    #amqRussianListViewport::-webkit-scrollbar {
+      display: none;
+      width: 0;
+      height: 0;
+    }
+
+    #amqRussianScrollbarTrack {
+      position: absolute;
+      z-index: 3;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      width: 8px;
+      background: transparent;
+      pointer-events: none;
+    }
+
+    #amqRussianScrollbarThumb {
+      position: absolute;
+      top: 0;
+      right: 1px;
+      width: 6px;
+      min-height: 20px;
+      background: rgba(255, 255, 255, 0.4);
+      border-radius: 5px;
+      pointer-events: auto;
+      cursor: pointer;
+      transform: scaleX(1);
+      transform-origin: right center;
+      transition: transform 120ms ease, background-color 120ms ease;
+    }
+
+    #amqRussianScrollbarThumb:hover,
+    #amqRussianScrollbarThumb.is-dragging {
+      background: color-mix(
+        in srgb,
+        var(--amq-russian-accent) 40%,
+        transparent
+      );
+      transform: scaleX(1.5);
+    }
+
+    .amqShikimoriRussianTitle {
+      position: absolute;
+      left: -253px;
+      top: 50%;
+      transform: translateY(-50%);
+      box-sizing: border-box;
+      width: 243px;
+      min-height: 79px;
+      padding: 12px 22px;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      border-radius: 8px;
+      background: var(--primaryColor, var(--primarycolor, rgba(0, 0, 0, .9)));
+      color: #f0f0f0;
+      font-size: 16px;
+      font-weight: 400;
+      line-height: 1.35;
+      text-align: center;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      z-index: 1000;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, .25);
+    }
+
+    .amqShikimoriRussianTitleArrow {
+      position: absolute;
+      right: -10px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 0;
+      height: 0;
+      border-top: 11px solid transparent;
+      border-bottom: 11px solid transparent;
+      border-left: 10px solid var(--primaryColor, var(--primarycolor, rgba(0, 0, 0, .9)));
+    }
+
+    .amqRussianSaveErrorToast {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      z-index: 1000000;
+      max-width: 360px;
+      padding: 10px 14px;
+      border-radius: 6px;
+      background: rgba(120, 20, 20, .95);
+      color: #fff;
+      font: 14px/1.4 sans-serif;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, .4);
+    }
+
+    .amqRussianStatusRow,
+    .amqRussianNoticeRow {
+      padding: 9px;
+      text-align: center;
+      font-weight: 400;
+    }
+
+    .amqRussianNoticeRow {
+      white-space: normal;
+    }
+
+    .amqRussianResultButton {
+      display: block;
+      width: 100%;
+      min-height: 6px;
+      padding: 6px 12px;
+      text-align: center;
+      border: 0;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 400;
+      line-height: 1.35;
+    }
+
+    .amqRussianResultSeparator,
+    .amqRussianResultAmqTitle {
+      opacity: .5;
+    }
+
+    .amqRussianMatch {
+      color: var(--amq-russian-accent);
+      font-weight: 400;
+    }
+  `;
+
+  const scriptStyle = document.createElement("style");
+  scriptStyle.textContent = SCRIPT_CSS;
+  document.head.appendChild(scriptStyle);
 })();
