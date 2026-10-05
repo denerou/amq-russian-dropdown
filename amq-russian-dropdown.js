@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         AMQ Russian DropDown
-// @version      1.9.7
+// @version      1.9.8
 // @description  
 // @match        https://animemusicquiz.com/*
 // @match        https://www.animemusicquiz.com/*
+// @updateURL    https://raw.githubusercontent.com/denerou/amq-russian-dropdown/main/amq-russian-title.user.js
+// @downloadURL  https://raw.githubusercontent.com/denerou/amq-russian-dropdown/main/amq-russian-title.user.js
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
 // @connect      amq.mistnotalone.com
