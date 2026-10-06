@@ -4,8 +4,8 @@
 // @description  
 // @match        https://animemusicquiz.com/*
 // @match        https://www.animemusicquiz.com/*
-// @updateURL    https://raw.githubusercontent.com/denerou/amq-russian-dropdown/main/amq-russian-dropdown.user.js
-// @downloadURL  https://raw.githubusercontent.com/denerou/amq-russian-dropdown/main/amq-russian-dropdown.user.js
+// @updateURL    https://raw.githubusercontent.com/denerou/amq-russian-dropdown/main/amq-russian-dropdown.js
+// @downloadURL  https://raw.githubusercontent.com/denerou/amq-russian-dropdown/main/amq-russian-dropdown.js
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
 // @connect      amq.mistnotalone.com
