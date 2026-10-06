@@ -1,7 +1,8 @@
 // ==UserScript==
 // @name         amq-russian-dropdown
-// @version      2.0.0
+// @version      2.0.1
 // @description  
+// @author       denero
 // @match        https://animemusicquiz.com/*
 // @match        https://www.animemusicquiz.com/*
 // @updateURL    https://raw.githubusercontent.com/denerou/amq-russian-dropdown/main/amq-russian-dropdown.user.js
