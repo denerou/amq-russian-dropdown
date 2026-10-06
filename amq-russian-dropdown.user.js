@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         amq-russian-dropdown
+// @name         AMQ Russian dropdown
 // @version      2.0.1
 // @description  
 // @author       denero
