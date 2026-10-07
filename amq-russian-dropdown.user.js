@@ -1209,7 +1209,6 @@
       });
   }
 
-  // Intercept wheel input anywhere inside the dropdown so AMQ volume is unaffected.
   document.addEventListener(
     "wheel",
     event => {
