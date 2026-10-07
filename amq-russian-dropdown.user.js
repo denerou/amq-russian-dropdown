@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         AMQ Russian dropdown
-// @version      2.0.1
+// @version      2.0.2
 // @description  
 // @author       denero
 // @match        https://animemusicquiz.com/*
