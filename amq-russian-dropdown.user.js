@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         amq-russian-dropdown
-// @version      2.1.0
+// @version      2.1.1
 // @description  
 // @author       denero
 // @match        https://animemusicquiz.com/*
@@ -31,7 +31,8 @@
     ["ся", "ша"], ["сю", "шу"], ["сё", "шо"], ["тя", "ча"], ["тю", "чу"],
     ["тё", "чо"], ["дзя", "джа"], ["дзю", "джу"], ["дзё", "джё"],
     ["мба", "нба"], ["мпа", "нпа"], ["мма", "нма"],
-    ["нъа", "н-а"], ["нъи", "н-и"], ["нъя", "нья"], ["тти", "ччи"], ["й", "и"], ["йо", "ио", "ё"]
+    ["нъа", "н-а"], ["нъи", "н-и"], ["нъя", "нья"], ["тти", "ччи"], 
+    ["й", "и"], ["йо", "ио", "ё"], ["дз", "з"], ["ё", "е"], ["cё", "шо"]
   ].sort((left, right) => right[0].length - left[0].length);
 
   // Кэши и состояние поиска
@@ -178,7 +179,7 @@
         queries.add(variant);
       }
     }
-    return [...queries].filter(candidate => candidate.length >= 2).slice(0, 25);
+    return [...queries].filter(candidate => candidate.length >= 2).slice(0, 8);
   }
 
   // Объединение результатов и сопоставление с AMQ
@@ -237,63 +238,90 @@
       const searchTerms = getTitleTransliterationVariants(query);
       const candidates = new Map();
       let lastError;
-      for (const term of searchTerms) {
-        if (term !== query.trim() && candidates.size) break;
+      const collectCandidates = response => {
+        if (!Array.isArray(response)) {
+          throw new Error("Shikimori search response is not an array");
+        }
+        for (const anime of response) {
+          if (
+            Number.isSafeInteger(anime?.id) &&
+            typeof anime?.russian === "string" &&
+            findTitleMatches(anime.russian, query)
+          ) {
+            candidates.set(anime.id, anime);
+          }
+        }
+      };
+      const requestSearchTerm = async term => {
         const searchUrl = new URL(`https://${SHIKIMORI_API_HOST}/api/animes`);
         searchUrl.searchParams.set("search", term);
         searchUrl.searchParams.set("limit", "50");
-        try {
-          const response = await requestJsonWithRetry(searchUrl.href, undefined);
-          if (!Array.isArray(response)) {
-            throw new Error("Shikimori search response is not an array");
-          }
-          for (const anime of response) {
-            if (
-              Number.isSafeInteger(anime?.id) &&
-              typeof anime?.russian === "string" &&
-              findTitleMatches(anime.russian, query)
-            ) {
-              candidates.set(anime.id, anime);
+        return requestJsonWithRetry(searchUrl.href, undefined);
+      };
+      try {
+        collectCandidates(await requestSearchTerm(searchTerms[0]));
+      } catch (error) {
+        lastError = error;
+      }
+      if (!candidates.size) {
+        for (let index = 1; index < searchTerms.length; index += 4) {
+          const responses = await Promise.allSettled(
+            searchTerms
+              .slice(index, index + 4)
+              .map(requestSearchTerm)
+          );
+          for (const response of responses) {
+            if (response.status === "rejected") {
+              lastError = response.reason;
+              continue;
+            }
+            try {
+              collectCandidates(response.value);
+            } catch (error) {
+              lastError = error;
             }
           }
-        } catch (error) {
-          lastError = error;
         }
       }
       if (!candidates.size && lastError) throw lastError;
       const results = [];
       const detailCandidates = [...candidates.values()].slice(0, 12);
-      for (const [index, candidate] of detailCandidates.entries()) {
-        try {
-          if (index > 0) {
-            await new Promise(resolve => setTimeout(resolve, 150));
-          }
-          const anime = extractShikimoriAnime(
-            await requestJsonWithRetry(
-              `https://${SHIKIMORI_API_HOST}/api/animes/${candidate.id}`,
-              undefined
+      const detailResponses = [];
+      for (let index = 0; index < detailCandidates.length; index += 4) {
+        detailResponses.push(
+          ...await Promise.allSettled(
+            detailCandidates.slice(index, index + 4).map(candidate =>
+              requestJsonWithRetry(
+                `https://${SHIKIMORI_API_HOST}/api/animes/${candidate.id}`,
+                undefined
+              )
             )
-          );
-          if (
-            !anime ||
-            typeof anime.russian !== "string" ||
-            !findTitleMatches(anime.russian, query)
-          ) {
-            continue;
-          }
-          const amqTitle = getAmqTitleMatchForAnime(anime);
-          const malId = Number(anime.myanimelist_id);
-          if (!amqTitle || !Number.isSafeInteger(malId) || malId < 1) continue;
-          results.push({
-            id: malId,
-            malId,
-            name: amqTitle.value,
-            amqTitle: amqTitle.label,
-            russian: anime.russian.trim()
-          });
-        } catch (error) {
-          lastError = error;
+          )
+        )
+      }
+      for (const response of detailResponses) {
+        if (response.status === "rejected") {
+          lastError = response.reason;
+          continue;
         }
+        const anime = extractShikimoriAnime(response.value);
+        if (
+          !anime ||
+          typeof anime.russian !== "string" ||
+          !findTitleMatches(anime.russian, query)
+        ) {
+          continue;
+        }
+        const amqTitle = getAmqTitleMatchForAnime(anime);
+        const malId = Number(anime.myanimelist_id);
+        if (!amqTitle || !Number.isSafeInteger(malId) || malId < 1) continue;
+        results.push({
+          id: malId,
+          malId,
+          name: amqTitle.value,
+          amqTitle: amqTitle.label,
+          russian: anime.russian.trim()
+        });
       }
       if (!results.length && lastError) throw lastError;
       shikimoriSearchCache.set(cacheKey, {
@@ -374,6 +402,28 @@
   ) {
     const requestCandidate = candidate =>
       requestJson(`${API_BASE}/api/search?q=${encodeURIComponent(candidate)}`);
+    let databaseResults = [];
+    let shikimoriResults = [];
+    const publishResults = () => {
+      const results = mergeAnimeResults([databaseResults, shikimoriResults]);
+      if (
+        results.some(anime =>
+          anime?.russian &&
+          anime?.name &&
+          findTitleMatches(anime.russian, query)
+        )
+      ) {
+        onDatabaseResults(results);
+      }
+    };
+    const shikimoriSearch = requestShikimoriSearchCandidates(query).then(
+      results => {
+        shikimoriResults = results;
+        publishResults();
+        return { results };
+      },
+      error => ({ error })
+    );
     let directResults = [];
     let directError;
     try {
@@ -381,31 +431,34 @@
     } catch (error) {
       directError = error;
     }
-    let successfulResponses = [];
     const mergedDirectResults = mergeAnimeResults([directResults]);
-    if (!hasUsableSearchMatch(mergedDirectResults, query)) {
-      const fallbackQueries = getCandidateSearchQueries(query)
-        .filter(candidate => candidate !== query.trim());
-      const responses = await Promise.allSettled(
-        fallbackQueries.map(requestCandidate)
-      );
-      successfulResponses = responses
-        .filter(response => response.status === "fulfilled")
-        .map(response => response.value);
-    }
-    const databaseResults = mergeAnimeResults([
+    databaseResults = mergedDirectResults;
+    publishResults();
+
+    const fallbackQueries = hasUsableSearchMatch(mergedDirectResults, query)
+      ? []
+      : getCandidateSearchQueries(query)
+          .filter(candidate => candidate !== query.trim());
+    const fallbackSearch = Promise.allSettled(
+      fallbackQueries.map(requestCandidate)
+    );
+    const responses = await fallbackSearch;
+    const successfulResponses = responses
+      .filter(response => response.status === "fulfilled")
+      .map(response => response.value);
+    databaseResults = mergeAnimeResults([
       directResults,
       ...successfulResponses
     ]);
-    onDatabaseResults(databaseResults);
-    let shikimoriResults = [];
-    try {
-      shikimoriResults = await requestShikimoriSearchCandidates(query);
-    } catch (error) {
-      if (!hasUsableSearchMatch(databaseResults, query)) {
-        throw directError || error;
-      }
+    publishResults();
+    const shikimoriResponse = await shikimoriSearch;
+    if (
+      shikimoriResponse.error &&
+      !hasUsableSearchMatch(databaseResults, query)
+    ) {
+      throw directError || shikimoriResponse.error;
     }
+    shikimoriResults = shikimoriResponse.results || [];
     if (
       directError &&
       successfulResponses.length === 0 &&
@@ -987,17 +1040,17 @@ const panel = document.createElement("div");
     }
   }
 
-  function dispatchEnter(input) {
-    const options = {
-      key: "Enter",
-      code: "Enter",
-      keyCode: 13,
-      which: 13,
-      bubbles: true,
-      cancelable: true
-    };
-    input.dispatchEvent(new KeyboardEvent("keydown", options));
-    input.dispatchEvent(new KeyboardEvent("keyup", options));
+  function submitNativeAnswer(answer) {
+    const typingInput = unsafeWindow.quiz?.answerInput?.typingInput;
+    if (!typingInput) {
+      throw new Error("AMQ answer input is not available");
+    }
+    const submitAnswer =
+      Object.getPrototypeOf(Object.getPrototypeOf(typingInput))?.submitAnswer;
+    if (typeof submitAnswer !== "function") {
+      throw new Error("AMQ submitAnswer method is not available");
+    }
+    submitAnswer.call(typingInput, answer);
   }
 
   function chooseNativeAmqOption(result, submitAfterSelection) {
@@ -1028,7 +1081,7 @@ const panel = document.createElement("div");
           })
         );
         if (submitAfterSelection) {
-          setTimeout(() => dispatchEnter(input), 0);
+          submitNativeAnswer(result.amqValue);
         }
         return;
       }
@@ -1233,7 +1286,7 @@ const panel = document.createElement("div");
     if (query.length < 2 || !/[а-яё]/i.test(query)) return;
     debounceTimer = setTimeout(() => {
       search(query, currentRequest);
-    }, 350);
+    }, 200);
   });
 
   document.addEventListener("pointerdown", event => {
