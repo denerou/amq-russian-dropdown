@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         amq-russian-dropdown
-// @version      2.1.1
-// @description  
+// @version      2.1.2
+// @description
 // @author       denero
 // @match        https://animemusicquiz.com/*
 // @match        https://www.animemusicquiz.com/*
@@ -26,12 +26,13 @@
   const pendingShikimoriSearches = new Map();
   const SHIKIMORI_SEARCH_CACHE_TTL_MS = 10 * 60 * 1000;
   const confirmedDiscoveredMalIds = new Set();
+  const SEARCH_INDICATOR_TIMEOUT_MS = 2500;
   const TITLE_TRANSLITERATION_GROUPS = [
     ["си", "ши"], ["ти", "чи"], ["цу", "тсу"], ["дзи", "джи"], ["фу", "ху"],
     ["ся", "ша"], ["сю", "шу"], ["сё", "шо"], ["тя", "ча"], ["тю", "чу"],
     ["тё", "чо"], ["дзя", "джа"], ["дзю", "джу"], ["дзё", "джё"],
     ["мба", "нба"], ["мпа", "нпа"], ["мма", "нма"],
-    ["нъа", "н-а"], ["нъи", "н-и"], ["нъя", "нья"], ["тти", "ччи"], 
+    ["нъа", "н-а"], ["нъи", "н-и"], ["нъя", "нья"], ["тти", "ччи"],
     ["й", "и"], ["йо", "ио", "ё"], ["дз", "з"], ["ё", "е"], ["cё", "шо"]
   ].sort((left, right) => right[0].length - left[0].length);
 
@@ -382,15 +383,11 @@
       }
     }
     void (async () => {
-      let hasSaveErrors = false;
       for (const candidate of uniqueCandidates.values()) {
         try {
           await persistDiscoveredShikimoriTitle(candidate, query);
-        } catch {
-          hasSaveErrors = true;
-        }
+        } catch {}
       }
-      if (hasSaveErrors) showSaveErrorToast();
     })();
   }
 
@@ -717,18 +714,21 @@ const panel = document.createElement("div");
 
   panel.append(viewport, scrollbarTrack);
 
-  let saveErrorToast;
-  let saveErrorToastTimer;
   let activeShikimoriRequest = 0;
 
   let debounceTimer;
   let statusTimer;
+  let searchIndicatorTimer;
   let requestId = 0;
   let keyboardIndex = -1;
   let mouseIndex = -1;
   let currentResults = [];
   let dragStartY = 0;
   let dragStartScrollTop = 0;
+  let answerRound = 0;
+  let selectionGeneration = 0;
+  let pendingNativeSelection = null;
+  let applyingNativeSelection = false;
 
   // Подсказка с русским названием после ответа
 
@@ -764,6 +764,12 @@ const panel = document.createElement("div");
   }
 
   function handleAnswerResults(data) {
+    answerRound++;
+    cancelPendingNativeSelection("new answer round");
+    keyboardIndex = -1;
+    mouseIndex = -1;
+    currentResults = [];
+    hidePanel();
     const currentRequest = ++activeShikimoriRequest;
     const malId = Number(data?.songInfo?.siteIds?.malId);
     const container = document.querySelector("#qpAnimeNameContainer");
@@ -847,22 +853,6 @@ const panel = document.createElement("div");
     );
   }
 
-  function showSaveErrorToast() {
-    if (!saveErrorToast) {
-      saveErrorToast = document.createElement("div");
-      saveErrorToast.setAttribute("role", "alert");
-      saveErrorToast.className = "amqRussianSaveErrorToast";
-      document.body.appendChild(saveErrorToast);
-    }
-    saveErrorToast.textContent =
-      "Не удалось сохранить один или несколько тайтлов Shikimori в базу.";
-    saveErrorToast.style.display = "block";
-    clearTimeout(saveErrorToastTimer);
-    saveErrorToastTimer = setTimeout(() => {
-      saveErrorToast.style.display = "none";
-    }, 6000);
-  }
-
   function stopStatusAnimation() {
     if (statusTimer) {
       clearInterval(statusTimer);
@@ -917,6 +907,7 @@ const panel = document.createElement("div");
 
   function hidePanel() {
     stopStatusAnimation();
+    clearTimeout(searchIndicatorTimer);
     panel.style.display = "none";
     keyboardIndex = -1;
     mouseIndex = -1;
@@ -944,6 +935,7 @@ const panel = document.createElement("div");
 
   function showNotice(message) {
     stopStatusAnimation();
+    clearTimeout(searchIndicatorTimer);
     currentResults = [];
     viewport.replaceChildren();
     const row = document.createElement("div");
@@ -1040,6 +1032,41 @@ const panel = document.createElement("div");
     }
   }
 
+  function cancelPendingNativeSelection(reason) {
+    if (!pendingNativeSelection) return;
+    clearTimeout(pendingNativeSelection.timer);
+    console.debug("[AMQ Russian Dropdown] Cancelled pending selection", {
+      reason,
+      answer: pendingNativeSelection.answer,
+      selectionRound: pendingNativeSelection.round,
+      currentRound: answerRound
+    });
+    pendingNativeSelection = null;
+    selectionGeneration++;
+  }
+
+  function refreshNativeAutocomplete() {
+    const controller =
+      unsafeWindow.quiz?.answerInput?.typingInput?.autoCompleteController;
+    if (typeof controller?.newList !== "function") {
+      console.error(
+        "[AMQ Russian Dropdown] AMQ autocomplete controller is unavailable; " +
+        "selection was cancelled without dispatching a synthetic input event."
+      );
+      return false;
+    }
+    try {
+      controller.newList();
+      return true;
+    } catch (error) {
+      console.error(
+        "[AMQ Russian Dropdown] Failed to refresh AMQ autocomplete.",
+        error
+      );
+      return false;
+    }
+  }
+
   function submitNativeAnswer(answer) {
     const typingInput = unsafeWindow.quiz?.answerInput?.typingInput;
     if (!typingInput) {
@@ -1056,12 +1083,32 @@ const panel = document.createElement("div");
   function chooseNativeAmqOption(result, submitAfterSelection) {
     const input = getInput();
     if (!input) return;
+    cancelPendingNativeSelection("superseded by a new selection");
     hidePanel();
+    const selectionId = ++selectionGeneration;
+    const selectionRound = answerRound;
+    pendingNativeSelection = {
+      answer: result.amqValue,
+      round: selectionRound,
+      timer: null
+    };
     input.value = result.amqValue;
     input.focus();
-    input.dispatchEvent(new Event("input", { bubbles: true }));
+    if (!refreshNativeAutocomplete()) {
+      cancelPendingNativeSelection("autocomplete refresh failed");
+      return;
+    }
     let attempts = 0;
     function selectAmqOption() {
+      if (
+        !pendingNativeSelection ||
+        selectionId !== selectionGeneration ||
+        selectionRound !== answerRound ||
+        input.value !== result.amqValue
+      ) {
+        cancelPendingNativeSelection("selection became stale");
+        return;
+      }
       const list = document.querySelector(
         "#qpAnswerInputContainer .awesomplete ul"
       );
@@ -1073,29 +1120,54 @@ const panel = document.createElement("div");
         item => normalize(item.textContent) === target
       );
       if (option) {
-        option.dispatchEvent(
-          new MouseEvent("mousedown", {
-            bubbles: true,
-            cancelable: true,
-            view: unsafeWindow
-          })
-        );
-        if (submitAfterSelection) {
+        applyingNativeSelection = true;
+        try {
+          option.dispatchEvent(
+            new MouseEvent("mousedown", {
+              bubbles: true,
+              cancelable: true,
+              view: unsafeWindow
+            })
+          );
+        } finally {
+          applyingNativeSelection = false;
+        }
+        if (
+          selectionRound === answerRound &&
+          input.value === result.amqValue &&
+          submitAfterSelection
+        ) {
           submitNativeAnswer(result.amqValue);
         }
+        pendingNativeSelection = null;
         return;
       }
       if (attempts++ < 20) {
-        setTimeout(selectAmqOption, 25);
+        pendingNativeSelection.timer = setTimeout(selectAmqOption, 25);
+      } else {
+        console.warn(
+          "[AMQ Russian Dropdown] Native AMQ suggestion did not appear in time.",
+          { answer: result.amqValue, attempts, round: answerRound }
+        );
+        pendingNativeSelection = null;
       }
     }
-    requestAnimationFrame(selectAmqOption);
+    pendingNativeSelection.timer = setTimeout(selectAmqOption, 0);
   }
 
   function showResults(results, query) {
     stopStatusAnimation();
+    clearTimeout(searchIndicatorTimer);
+    const selectedAmqTitle =
+      keyboardIndex >= 0
+        ? normalizeAmqTitle(currentResults[keyboardIndex]?.amqValue)
+        : "";
     currentResults = results;
-    keyboardIndex = -1;
+    keyboardIndex = selectedAmqTitle
+      ? results.findIndex(
+          result => normalizeAmqTitle(result.amqValue) === selectedAmqTitle
+        )
+      : -1;
     mouseIndex = -1;
     viewport.replaceChildren();
     if (!results.length) {
@@ -1143,8 +1215,8 @@ const panel = document.createElement("div");
 
   function renderSearchResults(animes, query, currentRequest, titleIndex) {
     if (currentRequest !== requestId || !Array.isArray(animes)) return;
-    const results = [];
-    const seen = new Set();
+    const bestResultByAmqTitle = new Map();
+    const normalizedQuery = normalize(query);
     for (const anime of animes) {
       if (!anime?.russian || !anime?.name) continue;
       if (!findTitleMatches(anime.russian, query)) continue;
@@ -1152,27 +1224,45 @@ const panel = document.createElement("div");
         getExactAmqTitleIndex()?.get(normalizeAmqTitle(anime.name)) ||
         titleIndex.get(normalize(anime.name)) ||
         { value: anime.name, label: anime.name };
-      const key = normalizeAmqTitle(match.value);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      results.push({
+      const result = {
         id: anime.id,
         russian: anime.russian,
         amqTitle: match.label,
-        amqValue: match.value
-      });
+        amqValue: match.value,
+        relevance: getSearchResultRelevance(anime.russian, normalizedQuery)
+      };
+      const key = normalizeAmqTitle(match.value);
+      const current = bestResultByAmqTitle.get(key);
+      if (!current || result.relevance > current.relevance) {
+        bestResultByAmqTitle.set(key, result);
+      }
     }
+    const results = [...bestResultByAmqTitle.values()];
     results.sort(
       (a, b) =>
-        a.russian.length - b.russian.length ||
+        b.relevance - a.relevance ||
         a.russian.localeCompare(b.russian, "ru")
     );
     if (results.length) {
       showResults(results, query);
     } else {
       stopStatusAnimation();
+      clearTimeout(searchIndicatorTimer);
       panel.style.display = "none";
     }
+  }
+
+  function getSearchResultRelevance(title, normalizedQuery) {
+    const normalizedTitle = normalize(title);
+    let score = 0;
+    if (normalizedTitle === normalizedQuery) score += 1000;
+    else if (normalizedTitle.startsWith(normalizedQuery)) score += 500;
+    else if (normalizedTitle.includes(` ${normalizedQuery}`)) score += 200;
+
+    if (/\b(?:ova|oav|special|recap|movie|film)\b/i.test(title)) {
+      score -= 1000;
+    }
+    return score - normalizedTitle.length;
   }
 
   function search(query, currentRequest) {
@@ -1182,11 +1272,32 @@ const panel = document.createElement("div");
       return;
     }
     showSearching();
+    clearTimeout(searchIndicatorTimer);
+    searchIndicatorTimer = setTimeout(() => {
+      if (currentRequest !== requestId || currentResults.length) return;
+      stopStatusAnimation();
+      panel.style.display = "none";
+    }, SEARCH_INDICATOR_TIMEOUT_MS);
+    const accumulatedResults = new Map();
+    const addResults = animes => {
+      for (const anime of animes) {
+        if (!anime?.russian || !anime?.name) continue;
+        const key =
+          `${normalizeAmqTitle(anime.russian)}\u0000${normalizeAmqTitle(anime.name)}`;
+        if (!accumulatedResults.has(key)) accumulatedResults.set(key, anime);
+      }
+      renderSearchResults(
+        [...accumulatedResults.values()],
+        query,
+        currentRequest,
+        titleIndex
+      );
+    };
     requestSearchCandidates(query, databaseResults => {
-      renderSearchResults(databaseResults, query, currentRequest, titleIndex);
+      addResults(databaseResults);
     })
       .then(animes => {
-        renderSearchResults(animes, query, currentRequest, titleIndex);
+        addResults(animes);
       })
       .catch(error => {
         if (currentRequest === requestId) {
@@ -1258,15 +1369,15 @@ const panel = document.createElement("div");
       if (!buttons.length) return;
       if (event.key === "ArrowDown") {
         event.preventDefault();
-        event.stopPropagation();
+        event.stopImmediatePropagation();
         setKeyboardIndex(keyboardIndex < 0 ? 0 : keyboardIndex + 1);
       } else if (event.key === "ArrowUp") {
         event.preventDefault();
-        event.stopPropagation();
+        event.stopImmediatePropagation();
         setKeyboardIndex(keyboardIndex < 0 ? 0 : keyboardIndex - 1);
       } else if (event.key === "Enter" && keyboardIndex >= 0) {
         event.preventDefault();
-        event.stopPropagation();
+        event.stopImmediatePropagation();
         const result = currentResults[keyboardIndex];
         if (result) chooseNativeAmqOption(result, true);
       }
@@ -1276,9 +1387,12 @@ const panel = document.createElement("div");
 
   document.addEventListener("input", event => {
     if (!event.target.matches("#qpAnswerInput")) return;
+    if (applyingNativeSelection) return;
+    cancelPendingNativeSelection("answer input changed");
     clearTimeout(debounceTimer);
     const query = event.target.value.trim();
     const currentRequest = ++requestId;
+    clearTimeout(searchIndicatorTimer);
     currentResults = [];
     keyboardIndex = -1;
     mouseIndex = -1;
@@ -1319,7 +1433,6 @@ const panel = document.createElement("div");
     #amqRussianScrollbarThumb:hover, #amqRussianScrollbarThumb.is-dragging { background: color-mix(in srgb, var(--amq-russian-accent) 40%, transparent); transform: scaleX(1.5); }
     .amqShikimoriRussianTitle { position: absolute; left: -253px; top: 50%; transform: translateY(-50%); box-sizing: border-box; width: 243px; min-height: 79px; padding: 12px 22px; display: none; align-items: center; justify-content: center; border-radius: 8px; background: var(--primaryColor, var(--primarycolor, rgba(0, 0, 0, .9))); color: #f0f0f0; font-size: 16px; font-weight: 400; line-height: 1.35; text-align: center; white-space: normal; overflow-wrap: anywhere; z-index: 1000; box-shadow: 0 2px 8px rgba(0, 0, 0, .25); }
     .amqShikimoriRussianTitleArrow { position: absolute; right: -10px; top: 50%; transform: translateY(-50%); width: 0; height: 0; border-top: 11px solid transparent; border-bottom: 11px solid transparent; border-left: 10px solid var(--primaryColor, var(--primarycolor, rgba(0, 0, 0, .9))); }
-    .amqRussianSaveErrorToast { position: fixed; right: 16px; bottom: 16px; z-index: 1000000; max-width: 360px; padding: 10px 14px; border-radius: 6px; background: rgba(120, 20, 20, .95); color: #fff; font: 14px/1.4 sans-serif; box-shadow: 0 2px 10px rgba(0, 0, 0, .4); }
     .amqRussianStatusRow, .amqRussianNoticeRow { padding: 9px; text-align: center; font-weight: 400; }
     .amqRussianNoticeRow { white-space: normal; }
     .amqRussianResultButton { display: block; width: 100%; min-height: 6px; padding: 6px 12px; text-align: center; border: 0; cursor: pointer; font: inherit; font-weight: 400; line-height: 1.35; }
