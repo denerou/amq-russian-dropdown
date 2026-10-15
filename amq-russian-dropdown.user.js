@@ -1,6 +1,6 @@
 // ==UserScript==
-// @name         AMQ Russian dropdown
-// @version      2.0.2
+// @name         amq-russian-dropdown
+// @version      2.1.0
 // @description  
 // @author       denero
 // @match        https://animemusicquiz.com/*
@@ -26,121 +26,24 @@
   const pendingShikimoriSearches = new Map();
   const SHIKIMORI_SEARCH_CACHE_TTL_MS = 10 * 60 * 1000;
   const confirmedDiscoveredMalIds = new Set();
-  let saveErrorToast;
-  let saveErrorToastTimer;
-  let activeShikimoriRequest = 0;
+  const TITLE_TRANSLITERATION_GROUPS = [
+    ["си", "ши"], ["ти", "чи"], ["цу", "тсу"], ["дзи", "джи"], ["фу", "ху"],
+    ["ся", "ша"], ["сю", "шу"], ["сё", "шо"], ["тя", "ча"], ["тю", "чу"],
+    ["тё", "чо"], ["дзя", "джа"], ["дзю", "джу"], ["дзё", "джё"],
+    ["мба", "нба"], ["мпа", "нпа"], ["мма", "нма"],
+    ["нъа", "н-а"], ["нъи", "н-и"], ["нъя", "нья"], ["тти", "ччи"], ["й", "и"], ["йо", "ио", "ё"]
+  ].sort((left, right) => right[0].length - left[0].length);
 
-  const COLORS = {
-    variables: {
-      textColor: "--textColor",
-      panelBackground: "--primaryColor",
-      accentColor: "--accentColor"
-    },
-    fallback: {
-      textColor: "#f4f4f4",
-      panelBackground: "#202124",
-      accentColor: "#c084fc"
-    },
-    current: {
-      textColor: "#f4f4f4",
-      panelBackground: "#202124",
-      accentColor: "#c084fc"
-    }
-  };
-
-  const panel = document.createElement("div");
-  panel.id = "amqRussianTitlePanel";
-  panel.className = "amqRussianTitlePanel";
-
-  const viewport = document.createElement("div");
-  viewport.id = "amqRussianListViewport";
-  viewport.className = "amqRussianListViewport";
-
-  const scrollbarTrack = document.createElement("div");
-  scrollbarTrack.id = "amqRussianScrollbarTrack";
-
-  const scrollbarThumb = document.createElement("div");
-  scrollbarThumb.id = "amqRussianScrollbarThumb";
-  scrollbarTrack.appendChild(scrollbarThumb);
-
-  panel.append(viewport, scrollbarTrack);
-
-  let debounceTimer;
-  let statusTimer;
-  let requestId = 0;
-  let keyboardIndex = -1;
-  let mouseIndex = -1;
-  let currentResults = [];
-  let dragStartY = 0;
-  let dragStartScrollTop = 0;
+  // Кэши и состояние поиска
   let amqTitlesCache = null;
   let amqTitleIndexCache = null;
   let exactAmqTitleIndexCache = null;
 
-  function getInput() {
-    return document.querySelector("#qpAnswerInput");
-  }
-
-  function updateColors(input) {
-    const nativeList = document.querySelector(
-      "#qpAnswerInputContainer .awesomplete ul"
-    );
-    const selectedOption = nativeList?.querySelector(
-      "li[aria-selected='true'], li:hover"
-    );
-    const variableElements = [];
-
-    for (let element = input; element; element = element.parentElement) {
-      variableElements.push(element);
-    }
-
-    if (document.body) variableElements.push(document.body);
-    if (document.documentElement) variableElements.push(document.documentElement);
-
-    function findColor(candidates) {
-      for (const [element, property] of candidates) {
-        if (!element) continue;
-        const color = getComputedStyle(element)[property].trim();
-        if (color && color !== "transparent" && color !== "rgba(0, 0, 0, 0)") {
-          return color;
-        }
-      }
-      return "";
-    }
-
-    for (const [key, variable] of Object.entries(COLORS.variables)) {
-      let value = "";
-
-      for (const element of variableElements) {
-        value = getComputedStyle(element).getPropertyValue(variable).trim();
-        if (value) break;
-      }
-
-      const candidates =
-        key === "textColor"
-          ? [[input, "color"], [nativeList, "color"], [selectedOption, "color"]]
-          : key === "panelBackground"
-            ? [[nativeList, "backgroundColor"], [input, "backgroundColor"]]
-            : [
-                [selectedOption, "backgroundColor"],
-                [document.querySelector(".btn-primary"), "backgroundColor"],
-                [input, "borderColor"]
-              ].filter(([element]) => element);
-
-      COLORS.current[key] =
-        value || findColor(candidates) || COLORS.fallback[key];
-    }
-
-    panel.style.setProperty(
-      "--amq-russian-accent",
-      COLORS.current.accentColor
-    );
-  }
+  // Нормализация названий и подготовка поиска
 
   function normalize(value) {
     return String(value || "")
       .toLowerCase()
-      .replace(/ё/g, "е")
       .normalize("NFKD")
       .replace(/[^\p{L}\p{N}]+/gu, " ")
       .trim()
@@ -151,10 +54,6 @@
   function normalizeAmqTitle(value) {
     return String(value || "")
       .toLowerCase()
-      .replace(/ё/g, "е")
-      .replace(/\b5-toubun\b/g, "gotoubun")
-      .replace(/∬/g, " season 2 ")
-      .replace(/[∽~]/g, " tilde ")
       .replace(/\b(\d+)(?:st|nd|rd|th)\s+season\b/g, "season $1")
       .normalize("NFKC")
       .replace(/[\uFE00-\uFE0F\u{E0100}-\u{E01EF}]/gu, "")
@@ -173,16 +72,20 @@
 
     for (let index = 0; index < characters.length; index++) {
       const character = characters[index];
+      const transliteration = getTitleTransliterationMatch(characters, index);
+      if (transliteration) {
+        pattern += `(?:${transliteration.alternatives
+          .map(escapeRegExp)
+          .join("|")})`;
+        index += transliteration.length - 1;
+        continue;
+      }
 
       if (/\s/u.test(character)) {
         while (index + 1 < characters.length && /\s/u.test(characters[index + 1])) {
           index++;
         }
         pattern += "[\\s\\p{P}\\p{S}]+";
-      } else if (character === "и") {
-        pattern += "[ий]";
-      } else if (character === "е" || character === "э" || character === "ё") {
-        pattern += "[еэё]";
       } else {
         pattern += character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       }
@@ -191,36 +94,62 @@
     return pattern;
   }
 
-  function findTitleMatches(title, query) {
-    return new RegExp(buildFlexibleTitlePattern(query), "iu").test(title);
+  function escapeRegExp(value) {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
 
-  function getSpellingVariants(value, limit = 8) {
-    const variants = new Set([value]);
-    const queue = [value];
+  function getTitleTransliterationMatch(characters, index) {
+    for (const group of TITLE_TRANSLITERATION_GROUPS) {
+      const matched = group.find(value =>
+        characters.slice(index, index + value.length).join("") === value
+      );
+      if (matched) return { length: matched.length, alternatives: group };
+    }
+
+    const character = characters[index];
+    if (character !== "е" && character !== "э") return null;
+
+    const previous = characters[index - 1] || "";
+    if (/[аеёиоуыэюя]/u.test(previous)) {
+      return {
+        length: 1,
+        alternatives: [character, character === "е" ? "э" : "е"]
+      };
+    }
+
+    if (/[\p{L}]/u.test(previous) || index === 0 || !/[\p{L}\p{N}]/u.test(previous)) {
+      return { length: 1, alternatives: [character, character === "е" ? "э" : "е"] };
+    }
+
+    return null;
+  }
+
+  function getTitleTransliterationVariants(value, limit = 8) {
+    const initial = String(value || "").trim().toLowerCase();
+    const variants = new Set([initial]);
+    const queue = [initial];
 
     while (queue.length && variants.size < limit) {
       const current = queue.shift();
       const characters = Array.from(current);
 
       for (let index = 0; index < characters.length; index++) {
-        const character = characters[index];
-        const alternatives =
-          character === "и"
-            ? ["й"]
-            : character === "й"
-              ? ["и"]
-              : character === "е" || character === "э" || character === "ё"
-                ? ["е", "э", "ё"].filter(candidate => candidate !== character)
-                : [];
+        const match = getTitleTransliterationMatch(characters, index);
+        if (!match) continue;
 
-        for (const alternative of alternatives) {
-          const changed = characters.slice();
-          changed[index] = alternative;
-          const variant = changed.join("");
-          if (!variants.has(variant) && variants.size < limit) {
-            variants.add(variant);
-            queue.push(variant);
+        const changedLength = match.length;
+        for (const alternative of match.alternatives) {
+          if (characters.slice(index, index + changedLength).join("") === alternative) {
+            continue;
+          }
+          const candidate = [
+            ...characters.slice(0, index),
+            ...Array.from(alternative),
+            ...characters.slice(index + changedLength)
+          ].join("");
+          if (!variants.has(candidate) && variants.size < limit) {
+            variants.add(candidate);
+            queue.push(candidate);
           }
         }
       }
@@ -229,6 +158,12 @@
     return [...variants];
   }
 
+  function findTitleMatches(title, query) {
+    return new RegExp(buildFlexibleTitlePattern(query), "iu").test(title);
+  }
+
+  // Поисковые варианты по правилам русской передачи японских слогов
+
   function getCandidateSearchQueries(query) {
     const words = String(query || "")
       .toLowerCase()
@@ -236,20 +171,20 @@
     const longestWords = [...new Set(words.filter(word => word.length >= 2))]
       .sort((left, right) => right.length - left.length)
       .slice(0, 3);
-    const queries = new Set([query.trim()]);
-
+    const queries = new Set(getTitleTransliterationVariants(query));
     for (const word of longestWords) {
-      for (const variant of getSpellingVariants(word)) {
+      queries.add(word);
+      for (const variant of getTitleTransliterationVariants(word)) {
         queries.add(variant);
       }
     }
-
     return [...queries].filter(candidate => candidate.length >= 2).slice(0, 25);
   }
 
+  // Объединение результатов и сопоставление с AMQ
+
   function mergeAnimeResults(responses) {
     const animes = new Map();
-
     for (const response of responses) {
       if (!Array.isArray(response)) continue;
       for (const anime of response) {
@@ -259,7 +194,6 @@
         if (!animes.has(key)) animes.set(key, anime);
       }
     }
-
     return [...animes.values()];
   }
 
@@ -280,15 +214,15 @@
       ...(Array.isArray(anime?.japanese) ? anime.japanese : []),
       ...(Array.isArray(anime?.synonyms) ? anime.synonyms : [])
     ];
-
     for (const name of names) {
       if (typeof name !== "string") continue;
       const exactMatch = exactTitleIndex?.get(normalizeAmqTitle(name));
       if (exactMatch) return exactMatch;
     }
-
     return null;
   }
+
+  // Поиск тайтлов на Shikimori
 
   function requestShikimoriSearchCandidates(query) {
     const cacheKey = query.trim().toLowerCase();
@@ -299,22 +233,15 @@
     if (pendingShikimoriSearches.has(cacheKey)) {
       return pendingShikimoriSearches.get(cacheKey);
     }
-
     const search = (async () => {
-      const searchTerms = [
-        query.trim(),
-        ...getSpellingVariants(query.trim(), 8)
-      ].filter((term, index, terms) => terms.indexOf(term) === index);
+      const searchTerms = getTitleTransliterationVariants(query);
       const candidates = new Map();
       let lastError;
-
       for (const term of searchTerms) {
         if (term !== query.trim() && candidates.size) break;
-
         const searchUrl = new URL(`https://${SHIKIMORI_API_HOST}/api/animes`);
         searchUrl.searchParams.set("search", term);
         searchUrl.searchParams.set("limit", "50");
-
         try {
           const response = await requestJsonWithRetry(searchUrl.href, undefined);
           if (!Array.isArray(response)) {
@@ -333,9 +260,7 @@
           lastError = error;
         }
       }
-
       if (!candidates.size && lastError) throw lastError;
-
       const results = [];
       const detailCandidates = [...candidates.values()].slice(0, 12);
       for (const [index, candidate] of detailCandidates.entries()) {
@@ -356,11 +281,9 @@
           ) {
             continue;
           }
-
           const amqTitle = getAmqTitleMatchForAnime(anime);
           const malId = Number(anime.myanimelist_id);
           if (!amqTitle || !Number.isSafeInteger(malId) || malId < 1) continue;
-
           results.push({
             id: malId,
             malId,
@@ -372,19 +295,18 @@
           lastError = error;
         }
       }
-
       if (!results.length && lastError) throw lastError;
-
       shikimoriSearchCache.set(cacheKey, {
         results,
         expiresAt: Date.now() + SHIKIMORI_SEARCH_CACHE_TTL_MS
       });
       return results;
     })().finally(() => pendingShikimoriSearches.delete(cacheKey));
-
     pendingShikimoriSearches.set(cacheKey, search);
     return search;
   }
+
+  // Проверка и сохранение найденных тайтлов через API
 
   async function persistDiscoveredShikimoriTitle(candidate, query) {
     const malId = Number(candidate.malId);
@@ -392,7 +314,6 @@
       typeof candidate.name === "string" ? candidate.name.trim() : "";
     const russianTitle =
       typeof candidate.russian === "string" ? candidate.russian.trim() : "";
-
     if (
       !Number.isSafeInteger(malId) ||
       malId < 1 ||
@@ -402,7 +323,6 @@
       return;
     }
     if (confirmedDiscoveredMalIds.has(malId)) return;
-
     const response = await requestJsonWithRetry(
       `${API_BASE}/api/discovered-title`,
       {
@@ -414,23 +334,6 @@
       throw new Error(`API did not confirm saving MAL ID ${malId}`);
     }
     confirmedDiscoveredMalIds.add(malId);
-  }
-
-  function showSaveErrorToast() {
-    if (!saveErrorToast) {
-      saveErrorToast = document.createElement("div");
-      saveErrorToast.setAttribute("role", "alert");
-      saveErrorToast.className = "amqRussianSaveErrorToast";
-      document.body.appendChild(saveErrorToast);
-    }
-
-    saveErrorToast.textContent =
-      "Не удалось сохранить один или несколько тайтлов Shikimori в базу.";
-    saveErrorToast.style.display = "block";
-    clearTimeout(saveErrorToastTimer);
-    saveErrorToastTimer = setTimeout(() => {
-      saveErrorToast.style.display = "none";
-    }, 6000);
   }
 
   function persistDiscoveredShikimoriTitles(
@@ -450,7 +353,6 @@
         uniqueCandidates.set(candidate.malId, candidate);
       }
     }
-
     void (async () => {
       let hasSaveErrors = false;
       for (const candidate of uniqueCandidates.values()) {
@@ -464,6 +366,8 @@
     })();
   }
 
+  // Поиск в базе и объединение результатов с Shikimori
+
   async function requestSearchCandidates(
     query,
     onDatabaseResults
@@ -472,13 +376,11 @@
       requestJson(`${API_BASE}/api/search?q=${encodeURIComponent(candidate)}`);
     let directResults = [];
     let directError;
-
     try {
       directResults = await requestCandidate(query);
     } catch (error) {
       directError = error;
     }
-
     let successfulResponses = [];
     const mergedDirectResults = mergeAnimeResults([directResults]);
     if (!hasUsableSearchMatch(mergedDirectResults, query)) {
@@ -491,13 +393,11 @@
         .filter(response => response.status === "fulfilled")
         .map(response => response.value);
     }
-
     const databaseResults = mergeAnimeResults([
       directResults,
       ...successfulResponses
     ]);
     onDatabaseResults(databaseResults);
-
     let shikimoriResults = [];
     try {
       shikimoriResults = await requestShikimoriSearchCandidates(query);
@@ -527,20 +427,18 @@
     return mergeAnimeResults([databaseResults, shikimoriResults]);
   }
 
+  // Получение и индексация списка названий AMQ
+
   function getAmqTitles() {
     if (amqTitlesCache) return amqTitlesCache;
-
     const list =
       unsafeWindow.quiz?.answerInput?.typingInput?.autoCompleteController?.list;
-
     if (!Array.isArray(list) || !list.length) return [];
-
     amqTitlesCache = list
       .map(item => {
         if (typeof item === "string") {
           return { value: item, label: item };
         }
-
         const value =
           item?.value ??
           item?.label ??
@@ -549,51 +447,44 @@
           item?.animeName ??
           "";
         const label = item?.label ?? value;
-
         return {
           value: String(value).trim(),
           label: String(label).trim()
         };
       })
       .filter(item => item.value);
-
     return amqTitlesCache;
   }
 
   function getAmqTitleIndex() {
     if (amqTitleIndexCache) return amqTitleIndexCache;
-
     const titles = getAmqTitles();
     if (!titles.length) return null;
-
     const index = new Map();
-
     for (const item of titles) {
       const key = normalize(item.value);
       if (key && !index.has(key)) {
         index.set(key, item);
       }
     }
-
     amqTitleIndexCache = index;
     return amqTitleIndexCache;
   }
 
   function getExactAmqTitleIndex() {
     if (exactAmqTitleIndexCache) return exactAmqTitleIndexCache;
-
     const titles = getAmqTitles();
     if (!titles.length) return null;
-
     const index = new Map();
     for (const item of titles) {
       const key = normalizeAmqTitle(item.value);
       if (key && !index.has(key)) index.set(key, item);
     }
-
     exactAmqTitleIndexCache = index;
     return exactAmqTitleIndexCache;
   }
+
+  // HTTP-запросы, повторы и проверка ответов
 
   function requestJson(url, options = {}) {
     return new Promise((resolve, reject) => {
@@ -606,7 +497,6 @@
         },
         data: options.body,
         timeout: 15000,
-
         onload(response) {
           if (response.status < 200 || response.status >= 300) {
             const error = new Error(
@@ -616,18 +506,15 @@
             reject(error);
             return;
           }
-
           try {
             resolve(JSON.parse(response.responseText));
           } catch (error) {
             reject(error);
           }
         },
-
         onerror() {
           reject(new Error(`Could not connect to ${new URL(url).hostname}`));
         },
-
         ontimeout() {
           reject(new Error(`Request timed out for ${new URL(url).hostname}`));
         }
@@ -663,20 +550,17 @@
     ) {
       return "";
     }
-
     return anime.russian.trim();
   }
 
   async function requestShikimoriTitle(malId) {
     const directUrl = `https://${SHIKIMORI_API_HOST}/api/animes/${malId}`;
-
     try {
       const anime = extractShikimoriAnime(await requestJson(directUrl));
       const title = getVerifiedRussianTitle(anime, malId);
       if (title) return title;
     } catch (error) {
     }
-
     const searchUrl = new URL(`https://${SHIKIMORI_API_HOST}/api/animes`);
     searchUrl.searchParams.set("myanimelist_id", String(malId));
     searchUrl.searchParams.set("limit", "10");
@@ -690,7 +574,6 @@
     const candidateDetails = matchingCandidates.length
       ? matchingCandidates
       : candidates.filter(candidate => Number.isSafeInteger(candidate?.id));
-
     const details = await Promise.all(
       candidateDetails.slice(0, 10).map(async candidate => {
         if (Number(candidate?.myanimelist_id) === malId) return candidate;
@@ -704,7 +587,6 @@
     const title = details
       .map(anime => getVerifiedRussianTitle(anime, malId))
       .find(Boolean);
-
     if (!title) {
       throw new Error(`Shikimori.io has no verified anime for MAL ID ${malId}`);
     }
@@ -719,13 +601,11 @@
     if (pendingShikimoriLookups.has(malId)) {
       return pendingShikimoriLookups.get(malId);
     }
-
     const lookup = (async () => {
       try {
         return await requestShikimoriTitle(malId);
       } catch (error) {
       }
-
       const apiUrl =
         `${API_BASE}/api/shikimori/anime?malId=${encodeURIComponent(malId)}`;
       const anime = extractShikimoriAnime(await requestJson(apiUrl));
@@ -743,10 +623,61 @@
       });
       return title;
     });
-
     pendingShikimoriLookups.set(malId, lookup);
     return lookup.finally(() => pendingShikimoriLookups.delete(malId));
   }
+
+  // Визуальная часть: элементы интерфейса и их состояние
+
+const COLORS = {
+    variables: {
+      textColor: "--textColor",
+      panelBackground: "--primaryColor",
+      accentColor: "--accentColor"
+    },
+    fallback: {
+      textColor: "#f4f4f4",
+      panelBackground: "#202124",
+      accentColor: "#c084fc"
+    },
+    current: {
+      textColor: "#f4f4f4",
+      panelBackground: "#202124",
+      accentColor: "#c084fc"
+    }
+  };
+
+const panel = document.createElement("div");
+  panel.id = "amqRussianTitlePanel";
+  panel.className = "amqRussianTitlePanel";
+
+  const viewport = document.createElement("div");
+  viewport.id = "amqRussianListViewport";
+  viewport.className = "amqRussianListViewport";
+
+  const scrollbarTrack = document.createElement("div");
+  scrollbarTrack.id = "amqRussianScrollbarTrack";
+
+  const scrollbarThumb = document.createElement("div");
+  scrollbarThumb.id = "amqRussianScrollbarThumb";
+  scrollbarTrack.appendChild(scrollbarThumb);
+
+  panel.append(viewport, scrollbarTrack);
+
+  let saveErrorToast;
+  let saveErrorToastTimer;
+  let activeShikimoriRequest = 0;
+
+  let debounceTimer;
+  let statusTimer;
+  let requestId = 0;
+  let keyboardIndex = -1;
+  let mouseIndex = -1;
+  let currentResults = [];
+  let dragStartY = 0;
+  let dragStartScrollTop = 0;
+
+  // Подсказка с русским названием после ответа
 
   function setShikimoriTooltipText(tooltip, text) {
     const content = tooltip.querySelector(".amqShikimoriRussianTitleText");
@@ -757,19 +688,15 @@
     const tooltipClass = "amqShikimoriRussianTitle";
     let tooltip = container.querySelector(`.${tooltipClass}`);
     if (tooltip) return tooltip;
-
     tooltip = document.createElement("div");
     tooltip.className = tooltipClass;
     tooltip.setAttribute("role", "status");
-
     const content = document.createElement("span");
     content.className = "amqShikimoriRussianTitleText";
-
     const arrow = document.createElement("div");
     arrow.className = "amqShikimoriRussianTitleArrow";
     arrow.setAttribute("aria-hidden", "true");
     tooltip.append(content, arrow);
-
     if (getComputedStyle(container).position === "static") {
       container.classList.add("amqRussianPositioned");
     }
@@ -780,7 +707,6 @@
     container.addEventListener("mouseleave", () => {
       tooltip.style.display = "none";
     });
-
     return tooltip;
   }
 
@@ -789,11 +715,9 @@
     const malId = Number(data?.songInfo?.siteIds?.malId);
     const container = document.querySelector("#qpAnimeNameContainer");
     if (!container || !Number.isSafeInteger(malId) || malId < 1) return;
-
     const tooltip = ensureShikimoriTooltip(container);
     setShikimoriTooltipText(tooltip, "Загружаю русское название…");
     tooltip.style.display = "none";
-
     requestShikimoriRussianTitle(malId)
       .then(title => {
         if (currentRequest !== activeShikimoriRequest || !container.isConnected) {
@@ -813,8 +737,77 @@
     if (typeof Listener !== "function") {
       return;
     }
-
     new Listener("answer results", handleAnswerResults).bindListener();
+  }
+
+  // Dropdown: оформление, отображение и взаимодействие
+
+  function getInput() {
+    return document.querySelector("#qpAnswerInput");
+  }
+
+  function updateColors(input) {
+    const nativeList = document.querySelector(
+      "#qpAnswerInputContainer .awesomplete ul"
+    );
+    const selectedOption = nativeList?.querySelector(
+      "li[aria-selected='true'], li:hover"
+    );
+    const variableElements = [];
+    for (let element = input; element; element = element.parentElement) {
+      variableElements.push(element);
+    }
+    if (document.body) variableElements.push(document.body);
+    if (document.documentElement) variableElements.push(document.documentElement);
+    function findColor(candidates) {
+      for (const [element, property] of candidates) {
+        if (!element) continue;
+        const color = getComputedStyle(element)[property].trim();
+        if (color && color !== "transparent" && color !== "rgba(0, 0, 0, 0)") {
+          return color;
+        }
+      }
+      return "";
+    }
+    for (const [key, variable] of Object.entries(COLORS.variables)) {
+      let value = "";
+      for (const element of variableElements) {
+        value = getComputedStyle(element).getPropertyValue(variable).trim();
+        if (value) break;
+      }
+      const candidates =
+        key === "textColor"
+          ? [[input, "color"], [nativeList, "color"], [selectedOption, "color"]]
+          : key === "panelBackground"
+            ? [[nativeList, "backgroundColor"], [input, "backgroundColor"]]
+            : [
+                [selectedOption, "backgroundColor"],
+                [document.querySelector(".btn-primary"), "backgroundColor"],
+                [input, "borderColor"]
+              ].filter(([element]) => element);
+      COLORS.current[key] =
+        value || findColor(candidates) || COLORS.fallback[key];
+    }
+    panel.style.setProperty(
+      "--amq-russian-accent",
+      COLORS.current.accentColor
+    );
+  }
+
+  function showSaveErrorToast() {
+    if (!saveErrorToast) {
+      saveErrorToast = document.createElement("div");
+      saveErrorToast.setAttribute("role", "alert");
+      saveErrorToast.className = "amqRussianSaveErrorToast";
+      document.body.appendChild(saveErrorToast);
+    }
+    saveErrorToast.textContent =
+      "Не удалось сохранить один или несколько тайтлов Shikimori в базу.";
+    saveErrorToast.style.display = "block";
+    clearTimeout(saveErrorToastTimer);
+    saveErrorToastTimer = setTimeout(() => {
+      saveErrorToast.style.display = "none";
+    }, 6000);
   }
 
   function stopStatusAnimation() {
@@ -830,24 +823,19 @@
       "#qpAnswerInputContainer .awesomplete"
     );
     if (!input || !wrapper) return;
-
     updateColors(input);
-
     if (getComputedStyle(wrapper).position === "static") {
       wrapper.classList.add("amqRussianPositioned");
     }
-
     if (panel.parentElement !== wrapper) {
       wrapper.appendChild(panel);
     }
-
     panel.style.left = "0";
     panel.style.top = `${input.offsetHeight}px`;
     panel.style.width = `${wrapper.getBoundingClientRect().width}px`;
     panel.style.font = getComputedStyle(input).font;
     panel.style.backgroundColor = COLORS.current.panelBackground;
     panel.style.color = COLORS.current.textColor;
-
     updateScrollbar();
   }
 
@@ -855,14 +843,11 @@
     const visibleHeight = viewport.clientHeight;
     const contentHeight = viewport.scrollHeight;
     const trackHeight = scrollbarTrack.clientHeight;
-
     if (!visibleHeight || !trackHeight || contentHeight <= visibleHeight) {
       scrollbarThumb.style.display = "none";
       return;
     }
-
     scrollbarThumb.style.display = "block";
-
     const thumbHeight = Math.max(
       20,
       trackHeight * (visibleHeight / contentHeight) * 0.25
@@ -873,7 +858,6 @@
       maxScrollTop > 0
         ? (viewport.scrollTop / maxScrollTop) * maxThumbTop
         : 0;
-
     scrollbarThumb.style.height = `${thumbHeight}px`;
     scrollbarThumb.style.top = `${thumbTop}px`;
   }
@@ -890,20 +874,16 @@
     stopStatusAnimation();
     currentResults = [];
     viewport.replaceChildren();
-
     const row = document.createElement("div");
     row.className = "amqRussianStatusRow";
     viewport.appendChild(row);
-
     const frames = ["...", ".", ".."];
     let frameIndex = 0;
     row.textContent = frames[frameIndex];
-
     statusTimer = setInterval(() => {
       frameIndex = (frameIndex + 1) % frames.length;
       row.textContent = frames[frameIndex];
     }, 200);
-
     positionPanel();
     panel.style.display = "block";
     updateScrollbar();
@@ -913,12 +893,10 @@
     stopStatusAnimation();
     currentResults = [];
     viewport.replaceChildren();
-
     const row = document.createElement("div");
     row.className = "amqRussianNoticeRow";
     row.textContent = message;
     viewport.appendChild(row);
-
     positionPanel();
     panel.style.display = "block";
     updateScrollbar();
@@ -929,12 +907,10 @@
     const matcher = new RegExp(buildFlexibleTitlePattern(query), "giu");
     let previousIndex = 0;
     let matchResult;
-
     if (!matcher.test(source)) {
       container.textContent = source;
       return;
     }
-
     matcher.lastIndex = 0;
     while ((matchResult = matcher.exec(source))) {
       if (matchResult.index > previousIndex) {
@@ -942,16 +918,13 @@
           document.createTextNode(source.slice(previousIndex, matchResult.index))
         );
       }
-
       const match = document.createElement("span");
       match.className = "amqRussianMatch";
       match.textContent = matchResult[0];
       container.append(match);
       previousIndex = matcher.lastIndex;
-
       if (matchResult[0].length === 0) matcher.lastIndex++;
     }
-
     if (previousIndex < source.length) {
       container.append(document.createTextNode(source.slice(previousIndex)));
     }
@@ -959,9 +932,7 @@
 
   function styleButton(button, state) {
     const matches = button.querySelectorAll(".amqRussianMatch");
-
     let foreground;
-
     if (state === "mouse") {
       button.style.backgroundColor = COLORS.current.accentColor;
       foreground = COLORS.current.panelBackground;
@@ -976,7 +947,6 @@
       foreground = COLORS.current.textColor;
       button.style.color = foreground;
     }
-
     matches.forEach(match => {
       match.style.color =
         state ? foreground : COLORS.current.accentColor;
@@ -985,16 +955,13 @@
 
   function refreshButtonStates() {
     const buttons = [...viewport.querySelectorAll("button[data-result-index]")];
-
     buttons.forEach((button, index) => {
       let state = "";
-
       if (index === mouseIndex) {
         state = "mouse";
       } else if (index === keyboardIndex) {
         state = "keyboard";
       }
-
       styleButton(button, state);
       button.setAttribute(
         "aria-selected",
@@ -1006,16 +973,13 @@
   function setKeyboardIndex(index) {
     const buttons = [...viewport.querySelectorAll("button[data-result-index]")];
     if (!buttons.length) return;
-
     keyboardIndex = (index + buttons.length) % buttons.length;
     refreshButtonStates();
-
     const selected = buttons[keyboardIndex];
     const rowTop = selected.offsetTop;
     const rowBottom = rowTop + selected.offsetHeight;
     const visibleTop = viewport.scrollTop;
     const visibleBottom = visibleTop + viewport.clientHeight;
-
     if (rowTop < visibleTop) {
       viewport.scrollTop = rowTop;
     } else if (rowBottom > visibleBottom) {
@@ -1032,7 +996,6 @@
       bubbles: true,
       cancelable: true
     };
-
     input.dispatchEvent(new KeyboardEvent("keydown", options));
     input.dispatchEvent(new KeyboardEvent("keyup", options));
   }
@@ -1040,28 +1003,22 @@
   function chooseNativeAmqOption(result, submitAfterSelection) {
     const input = getInput();
     if (!input) return;
-
     hidePanel();
     input.value = result.amqValue;
     input.focus();
     input.dispatchEvent(new Event("input", { bubbles: true }));
-
     let attempts = 0;
-
     function selectAmqOption() {
       const list = document.querySelector(
         "#qpAnswerInputContainer .awesomplete ul"
       );
-
       const options = list
         ? [...list.querySelectorAll("li[role='option'], li")]
         : [];
-
       const target = normalize(result.amqValue);
       const option = options.find(
         item => normalize(item.textContent) === target
       );
-
       if (option) {
         option.dispatchEvent(
           new MouseEvent("mousedown", {
@@ -1070,18 +1027,15 @@
             view: unsafeWindow
           })
         );
-
         if (submitAfterSelection) {
           setTimeout(() => dispatchEnter(input), 0);
         }
         return;
       }
-
       if (attempts++ < 20) {
         setTimeout(selectAmqOption, 25);
       }
     }
-
     requestAnimationFrame(selectAmqOption);
   }
 
@@ -1091,55 +1045,43 @@
     keyboardIndex = -1;
     mouseIndex = -1;
     viewport.replaceChildren();
-
     if (!results.length) {
       panel.style.display = "none";
       return;
     }
-
     results.forEach((result, index) => {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "amqRussianResultButton";
       button.dataset.resultIndex = String(index);
       button.setAttribute("aria-selected", "false");
-
       const russianTitle = document.createElement("span");
       appendHighlightedText(russianTitle, result.russian, query);
-
       const separator = document.createElement("span");
       separator.className = "amqRussianResultSeparator";
       separator.textContent = " / ";
-
       const amqTitle = document.createElement("span");
       amqTitle.className = "amqRussianResultAmqTitle";
       amqTitle.textContent = result.amqTitle;
-
       button.append(russianTitle, separator, amqTitle);
-
       button.addEventListener("pointerenter", () => {
         mouseIndex = index;
         refreshButtonStates();
       });
-
       button.addEventListener("pointerleave", () => {
         if (mouseIndex === index) {
           mouseIndex = -1;
           refreshButtonStates();
         }
       });
-
       button.addEventListener("pointerdown", event => {
         event.preventDefault();
       });
-
       button.addEventListener("click", () => {
         chooseNativeAmqOption(result, false);
       });
-
       viewport.appendChild(button);
     });
-
     positionPanel();
     panel.style.display = "block";
     updateScrollbar();
@@ -1148,14 +1090,11 @@
 
   function renderSearchResults(animes, query, currentRequest, titleIndex) {
     if (currentRequest !== requestId || !Array.isArray(animes)) return;
-
     const results = [];
     const seen = new Set();
-
     for (const anime of animes) {
       if (!anime?.russian || !anime?.name) continue;
       if (!findTitleMatches(anime.russian, query)) continue;
-
       const match =
         getExactAmqTitleIndex()?.get(normalizeAmqTitle(anime.name)) ||
         titleIndex.get(normalize(anime.name)) ||
@@ -1163,7 +1102,6 @@
       const key = normalizeAmqTitle(match.value);
       if (seen.has(key)) continue;
       seen.add(key);
-
       results.push({
         id: anime.id,
         russian: anime.russian,
@@ -1171,13 +1109,11 @@
         amqValue: match.value
       });
     }
-
     results.sort(
       (a, b) =>
         a.russian.length - b.russian.length ||
         a.russian.localeCompare(b.russian, "ru")
     );
-
     if (results.length) {
       showResults(results, query);
     } else {
@@ -1188,14 +1124,11 @@
 
   function search(query, currentRequest) {
     const titleIndex = getAmqTitleIndex();
-
     if (!titleIndex?.size) {
       showNotice("Список названий AMQ пока недоступен.");
       return;
     }
-
     showSearching();
-
     requestSearchCandidates(query, databaseResults => {
       renderSearchResults(databaseResults, query, currentRequest, titleIndex);
     })
@@ -1209,16 +1142,18 @@
       });
   }
 
+
+
+  // Обработчики событий страницы
+
   document.addEventListener(
     "wheel",
     event => {
       if (panel.style.display === "none" || !panel.contains(event.target)) {
         return;
       }
-
       event.preventDefault();
       event.stopImmediatePropagation();
-
       viewport.scrollTop += event.deltaY;
       updateScrollbar();
     },
@@ -1227,7 +1162,6 @@
 
   scrollbarThumb.addEventListener("pointerdown", event => {
     event.preventDefault();
-
     dragStartY = event.clientY;
     dragStartScrollTop = viewport.scrollTop;
     scrollbarThumb.classList.add("is-dragging");
@@ -1236,13 +1170,10 @@
 
   scrollbarThumb.addEventListener("pointermove", event => {
     if (!scrollbarThumb.hasPointerCapture(event.pointerId)) return;
-
     const maxThumbTop =
       scrollbarTrack.clientHeight - scrollbarThumb.offsetHeight;
     const maxScrollTop = viewport.scrollHeight - viewport.clientHeight;
-
     if (maxThumbTop <= 0 || maxScrollTop <= 0) return;
-
     const delta = event.clientY - dragStartY;
     const newThumbTop = Math.max(
       0,
@@ -1251,7 +1182,6 @@
         (dragStartScrollTop / maxScrollTop) * maxThumbTop + delta
       )
     );
-
     viewport.scrollTop = (newThumbTop / maxThumbTop) * maxScrollTop;
   });
 
@@ -1259,7 +1189,6 @@
     if (scrollbarThumb.hasPointerCapture(event.pointerId)) {
       scrollbarThumb.releasePointerCapture(event.pointerId);
     }
-
     scrollbarThumb.classList.remove("is-dragging");
   }
 
@@ -1272,10 +1201,8 @@
     event => {
       if (!event.target.matches("#qpAnswerInput")) return;
       if (panel.style.display === "none") return;
-
       const buttons = viewport.querySelectorAll("button[data-result-index]");
       if (!buttons.length) return;
-
       if (event.key === "ArrowDown") {
         event.preventDefault();
         event.stopPropagation();
@@ -1287,7 +1214,6 @@
       } else if (event.key === "Enter" && keyboardIndex >= 0) {
         event.preventDefault();
         event.stopPropagation();
-
         const result = currentResults[keyboardIndex];
         if (result) chooseNativeAmqOption(result, true);
       }
@@ -1297,19 +1223,14 @@
 
   document.addEventListener("input", event => {
     if (!event.target.matches("#qpAnswerInput")) return;
-
     clearTimeout(debounceTimer);
-
     const query = event.target.value.trim();
     const currentRequest = ++requestId;
-
     currentResults = [];
     keyboardIndex = -1;
     mouseIndex = -1;
     panel.style.display = "none";
-
     if (query.length < 2 || !/[а-яё]/i.test(query)) return;
-
     debounceTimer = setTimeout(() => {
       search(query, currentRequest);
     }, 350);
@@ -1334,161 +1255,27 @@
     }
   }, 500);
 
+  // CSS: стили dropdown, подсказок и уведомлений
   const SCRIPT_CSS = `
-    #amqRussianTitlePanel {
-      display: none;
-      position: absolute;
-      z-index: 999999;
-      border: 0;
-      border-radius: 8px;
-      box-shadow: 0 0 10px 2px #000;
-      overflow: hidden;
-      font-weight: 400;
-    }
-
-    .amqRussianPositioned {
-      position: relative;
-    }
-
-    #amqRussianListViewport {
-      position: relative;
-      max-height: 260px;
-      overflow-y: auto;
-      overflow-x: hidden;
-      overscroll-behavior: contain;
-      scrollbar-width: none;
-      -ms-overflow-style: none;
-    }
-
-    #amqRussianListViewport::-webkit-scrollbar {
-      display: none;
-      width: 0;
-      height: 0;
-    }
-
-    #amqRussianScrollbarTrack {
-      position: absolute;
-      z-index: 3;
-      top: 0;
-      right: 0;
-      bottom: 0;
-      width: 8px;
-      background: transparent;
-      pointer-events: none;
-    }
-
-    #amqRussianScrollbarThumb {
-      position: absolute;
-      top: 0;
-      right: 1px;
-      width: 6px;
-      min-height: 20px;
-      background: rgba(255, 255, 255, 0.4);
-      border-radius: 5px;
-      pointer-events: auto;
-      cursor: pointer;
-      transform: scaleX(1);
-      transform-origin: right center;
-      transition: transform 120ms ease, background-color 120ms ease;
-    }
-
-    #amqRussianScrollbarThumb:hover,
-    #amqRussianScrollbarThumb.is-dragging {
-      background: color-mix(
-        in srgb,
-        var(--amq-russian-accent) 40%,
-        transparent
-      );
-      transform: scaleX(1.5);
-    }
-
-    .amqShikimoriRussianTitle {
-      position: absolute;
-      left: -253px;
-      top: 50%;
-      transform: translateY(-50%);
-      box-sizing: border-box;
-      width: 243px;
-      min-height: 79px;
-      padding: 12px 22px;
-      display: none;
-      align-items: center;
-      justify-content: center;
-      border-radius: 8px;
-      background: var(--primaryColor, var(--primarycolor, rgba(0, 0, 0, .9)));
-      color: #f0f0f0;
-      font-size: 16px;
-      font-weight: 400;
-      line-height: 1.35;
-      text-align: center;
-      white-space: normal;
-      overflow-wrap: anywhere;
-      z-index: 1000;
-      box-shadow: 0 2px 8px rgba(0, 0, 0, .25);
-    }
-
-    .amqShikimoriRussianTitleArrow {
-      position: absolute;
-      right: -10px;
-      top: 50%;
-      transform: translateY(-50%);
-      width: 0;
-      height: 0;
-      border-top: 11px solid transparent;
-      border-bottom: 11px solid transparent;
-      border-left: 10px solid var(--primaryColor, var(--primarycolor, rgba(0, 0, 0, .9)));
-    }
-
-    .amqRussianSaveErrorToast {
-      position: fixed;
-      right: 16px;
-      bottom: 16px;
-      z-index: 1000000;
-      max-width: 360px;
-      padding: 10px 14px;
-      border-radius: 6px;
-      background: rgba(120, 20, 20, .95);
-      color: #fff;
-      font: 14px/1.4 sans-serif;
-      box-shadow: 0 2px 10px rgba(0, 0, 0, .4);
-    }
-
-    .amqRussianStatusRow,
-    .amqRussianNoticeRow {
-      padding: 9px;
-      text-align: center;
-      font-weight: 400;
-    }
-
-    .amqRussianNoticeRow {
-      white-space: normal;
-    }
-
-    .amqRussianResultButton {
-      display: block;
-      width: 100%;
-      min-height: 6px;
-      padding: 6px 12px;
-      text-align: center;
-      border: 0;
-      cursor: pointer;
-      font: inherit;
-      font-weight: 400;
-      line-height: 1.35;
-    }
-
-    .amqRussianResultSeparator,
-    .amqRussianResultAmqTitle {
-      opacity: .5;
-    }
-
-    .amqRussianMatch {
-      color: var(--amq-russian-accent);
-      font-weight: 400;
-    }
+    #amqRussianTitlePanel { display: none; position: absolute; z-index: 999999; border: 0; border-radius: 8px; box-shadow: 0 0 10px 2px #000; overflow: hidden; font-weight: 400; }
+    .amqRussianPositioned { position: relative; }
+    #amqRussianListViewport { position: relative; max-height: 260px; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; scrollbar-width: none; -ms-overflow-style: none; }
+    #amqRussianListViewport::-webkit-scrollbar { display: none; width: 0; height: 0; }
+    #amqRussianScrollbarTrack { position: absolute; z-index: 3; top: 0; right: 0; bottom: 0; width: 8px; background: transparent; pointer-events: none; }
+    #amqRussianScrollbarThumb { position: absolute; top: 0; right: 1px; width: 6px; min-height: 20px; background: rgba(255, 255, 255, 0.4); border-radius: 5px; pointer-events: auto; cursor: pointer; transform: scaleX(1); transform-origin: right center; transition: transform 120ms ease, background-color 120ms ease; }
+    #amqRussianScrollbarThumb:hover, #amqRussianScrollbarThumb.is-dragging { background: color-mix(in srgb, var(--amq-russian-accent) 40%, transparent); transform: scaleX(1.5); }
+    .amqShikimoriRussianTitle { position: absolute; left: -253px; top: 50%; transform: translateY(-50%); box-sizing: border-box; width: 243px; min-height: 79px; padding: 12px 22px; display: none; align-items: center; justify-content: center; border-radius: 8px; background: var(--primaryColor, var(--primarycolor, rgba(0, 0, 0, .9))); color: #f0f0f0; font-size: 16px; font-weight: 400; line-height: 1.35; text-align: center; white-space: normal; overflow-wrap: anywhere; z-index: 1000; box-shadow: 0 2px 8px rgba(0, 0, 0, .25); }
+    .amqShikimoriRussianTitleArrow { position: absolute; right: -10px; top: 50%; transform: translateY(-50%); width: 0; height: 0; border-top: 11px solid transparent; border-bottom: 11px solid transparent; border-left: 10px solid var(--primaryColor, var(--primarycolor, rgba(0, 0, 0, .9))); }
+    .amqRussianSaveErrorToast { position: fixed; right: 16px; bottom: 16px; z-index: 1000000; max-width: 360px; padding: 10px 14px; border-radius: 6px; background: rgba(120, 20, 20, .95); color: #fff; font: 14px/1.4 sans-serif; box-shadow: 0 2px 10px rgba(0, 0, 0, .4); }
+    .amqRussianStatusRow, .amqRussianNoticeRow { padding: 9px; text-align: center; font-weight: 400; }
+    .amqRussianNoticeRow { white-space: normal; }
+    .amqRussianResultButton { display: block; width: 100%; min-height: 6px; padding: 6px 12px; text-align: center; border: 0; cursor: pointer; font: inherit; font-weight: 400; line-height: 1.35; }
+    .amqRussianResultSeparator, .amqRussianResultAmqTitle { opacity: .5; }
+    .amqRussianMatch { color: var(--amq-russian-accent); font-weight: 400; }
   `;
 
   const scriptStyle = document.createElement("style");
   scriptStyle.textContent = SCRIPT_CSS;
   document.head.appendChild(scriptStyle);
+
 })();
