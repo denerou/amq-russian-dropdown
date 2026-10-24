@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         AMQ Russian Dropdown
-// @version      3.1.1
+// @version      3.1.2
 // @description
 // @author       denero
 // @match        https://animemusicquiz.com/*
@@ -45,7 +45,7 @@
   const confirmedDiscoveredMalIds = new Set();
   const searchResultCache = new Map();
   const compiledPatternCache = new Map();
-
+  
   const annIdToMalIdMap = new Map();
   let lastKnownMalId = null;
 
@@ -875,10 +875,10 @@
   function handleAnswerResults(data) {
     answerRound++;
     hidePanel();
-
+    
     const annId = Number(data?.songInfo?.siteIds?.annId);
     const malId = Number(data?.songInfo?.siteIds?.malId);
-
+    
     if (Number.isSafeInteger(annId) && annId > 0 && Number.isSafeInteger(malId) && malId > 0) {
       annIdToMalIdMap.set(annId, malId);
     }
@@ -889,9 +889,14 @@
     const currentRequest = ++activeAnswerTitleRequest;
     const container = document.querySelector("#qpAnimeNameContainer");
     if (!container || !Number.isSafeInteger(malId) || malId < 1) return;
+    
     const tooltip = ensureAnswerRussianTitleTooltip(container);
-    setAnswerRussianTitle(tooltip, "Загружаю русское название из базы…");
+    
+    // Не показываем "Загружаю...", а просто очищаем. Если данных нет — тултип не появится при наведении.
+    const content = tooltip.querySelector(".amqAnswerRussianTitleText");
+    if (content) content.textContent = "";
     tooltip.style.display = "none";
+
     requestNameItemRussianTitle(malId)
       .then(result => {
         if (currentRequest !== activeAnswerTitleRequest || !container.isConnected) {
@@ -1503,13 +1508,24 @@
     const normalizedQuery = normalize(targetQuery);
     for (const anime of animes) {
       if (!anime?.russian || !anime?.name) continue;
-
+      
+      // Предзаполняем кэш русских названий и алиасов (если API вернуло их в поиске)
+      if (anime.malId && !nameItemRussianTitleCache.has(`mal:${anime.malId}`)) {
+        const aliases = Array.isArray(anime.russianAliases) ? anime.russianAliases : [];
+        if (anime.russian || aliases.length > 0) {
+          nameItemRussianTitleCache.set(`mal:${anime.malId}`, Promise.resolve({
+            animeRussian: anime.russian?.trim() || null,
+            russianAliases: aliases.map(a => a.trim()).filter(Boolean)
+          }));
+        }
+      }
+      
       const namesToCheck = [
         anime.russian,
         ...(Array.isArray(anime.russianAliases) ? anime.russianAliases : []),
         ...(Array.isArray(anime.synonyms) ? anime.synonyms : [])
       ];
-
+      
       const matchedName = namesToCheck.find(name => typeof name === "string" && findTitleMatches(name, targetQuery));
       if (!matchedName) continue;
 
