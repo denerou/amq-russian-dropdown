@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         AMQ Russian Dropdown
-// @version      3.2
+// @version      3.3
 // @description
 // @author       denero
 // @match        https://animemusicquiz.com/*
@@ -96,7 +96,16 @@
       }
 
       if (isSeparator(character)) {
-        pattern += "[\\s\\p{P}\\p{S}]";
+        let sepCount = 1;
+        while (index + 1 < characters.length && isSeparator(characters[index + 1])) {
+          sepCount++;
+          index++;
+        }
+        if (sepCount <= 2) {
+          pattern += "[\\s\\p{P}\\p{S}]+";
+        } else {
+          pattern += `[\\s\\p{P}\\p{S}]{${sepCount}}`;
+        }
       } else {
         pattern += character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       }
@@ -728,23 +737,21 @@
       return Promise.reject(new Error("No IDs provided"));
     }
 
-    // Уникальный ключ кэша
     const cacheKey = malId ? `mal:${malId}` : `ann:${annId}`;
     if (nameItemRussianTitleCache.has(cacheKey)) {
       return nameItemRussianTitleCache.get(cacheKey);
     }
 
-    // Внутренняя функция для выполнения конкретного запроса
     const fetchVariant = async (params) => {
       const url = new URL(`${API_BASE}/api/name-item`);
       if (params.annId) url.searchParams.set("annId", String(params.annId));
       if (params.malId) url.searchParams.set("malId", String(params.malId));
 
       const response = await requestJson(url.href);
+      const data = Array.isArray(response) ? response[0] : response;
 
-      // Поддерживаем как camelCase (animeRussian), так и сырые имена из Mongo ("Anime Russian")
-      const russianTitle = response?.animeRussian || response?.russian || response?.["Anime Russian"];
-      const aliases = response?.russianAliases || response?.["Russian Alias"] || [];
+      const russianTitle = data?.["Anime Russian"] || data?.animeRussian || data?.russian;
+      const aliases = data?.["Russian Alias"] || data?.russianAliases || [];
 
       if (russianTitle || (Array.isArray(aliases) && aliases.length > 0)) {
         return {
@@ -754,26 +761,22 @@
             : []
         };
       }
-      return null; // Данные не найдены
+      return null;
     };
 
     const lookup = (async () => {
       let result = null;
 
-      // 1. Пытаемся запросить сразу по обоим ID
       if (annId && malId) {
         try { result = await fetchVariant({ annId, malId }); } catch (e) {}
       }
-      // 2. Если не вышло, пробуем только по MAL ID
       if (!result && malId) {
         try { result = await fetchVariant({ malId }); } catch (e) {}
       }
-      // 3. Если не вышло, пробуем только по ANN ID
       if (!result && annId) {
         try { result = await fetchVariant({ annId }); } catch (e) {}
       }
 
-      // Если совсем ничего не нашли, возвращаем пустоту без выброса ошибки
       return result || { animeRussian: null, russianAliases: [] };
     })();
 
@@ -1527,16 +1530,6 @@
     const normalizedQuery = normalize(targetQuery);
     for (const anime of animes) {
       if (!anime?.russian || !anime?.name) continue;
-
-      if (anime.malId && !nameItemRussianTitleCache.has(`mal:${anime.malId}`)) {
-        const aliases = Array.isArray(anime.russianAliases) ? anime.russianAliases : [];
-        if (anime.russian || aliases.length > 0) {
-          nameItemRussianTitleCache.set(`mal:${anime.malId}`, Promise.resolve({
-            animeRussian: anime.russian?.trim() || null,
-            russianAliases: aliases.map(a => a.trim()).filter(Boolean)
-          }));
-        }
-      }
 
       const namesToCheck = [
         anime.russian,
