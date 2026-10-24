@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         AMQ Russian Dropdown
-// @version      3.1.3
+// @version      3.2
 // @description
 // @author       denero
 // @match        https://animemusicquiz.com/*
@@ -80,8 +80,9 @@
   }
 
   function buildFlexibleTitlePattern(query) {
-    const characters = Array.from(String(query || "").trim().toLowerCase());
+    const characters = Array.from(String(query || "").toLowerCase());
     let pattern = "";
+    const isSeparator = (ch) => /[\s\p{P}\p{S}]/u.test(ch);
 
     for (let index = 0; index < characters.length; index++) {
       const character = characters[index];
@@ -94,11 +95,8 @@
         continue;
       }
 
-      if (/\s/u.test(character)) {
-        while (index + 1 < characters.length && /\s/u.test(characters[index + 1])) {
-          index++;
-        }
-        pattern += "[\\s\\p{P}\\p{S}]+";
+      if (isSeparator(character)) {
+        pattern += "[\\s\\p{P}\\p{S}]";
       } else {
         pattern += character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       }
@@ -164,7 +162,7 @@
   }
 
   function getCompiledPattern(query) {
-    const key = String(query || "").trim().toLowerCase();
+    const key = String(query || "").toLowerCase();
     if (!key) return null;
     const cached = compiledPatternCache.get(key);
     if (cached) return cached;
@@ -298,8 +296,9 @@
     return getAmqTitleMatchesForAnime(anime)[0] || null;
   }
 
-  function requestShikimoriSearchCandidates(query) {
-    const cacheKey = query.trim().toLowerCase();
+  function requestShikimoriSearchCandidates(rawQuery) {
+    const query = rawQuery.trim();
+    const cacheKey = query.toLowerCase();
     const cached = shikimoriSearchCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
       return Promise.resolve(cached.results);
@@ -479,8 +478,9 @@
     if (cached && cached.expiresAt > Date.now()) {
       return Promise.resolve(cached.results);
     }
+    const apiQuery = candidate.trim();
     return requestJson(
-      `${API_BASE}/api/search?q=${encodeURIComponent(candidate)}`
+      `${API_BASE}/api/search?q=${encodeURIComponent(apiQuery)}`
     ).then(results => {
       if (searchResultCache.size >= SEARCH_CACHE_MAX_ENTRIES) {
         const oldest = [...searchResultCache.entries()]
@@ -516,7 +516,8 @@
       });
   }
 
-  async function requestSearchCandidates(query, onDatabaseResults) {
+  async function requestSearchCandidates(rawQuery, onDatabaseResults) {
+    const query = rawQuery.trim();
     const requestCandidate = candidate => requestCachedSearch(candidate);
     let databaseResults = [];
     let shikimoriResults = [];
@@ -543,7 +544,7 @@
     }
 
     const fallbackQueries = getCandidateSearchQueries(query)
-      .filter(candidate => candidate !== query.trim());
+      .filter(candidate => candidate !== query);
 
     let anyFallbackSuccess = false;
     await Promise.allSettled(
@@ -726,33 +727,56 @@
     if (!annId && !malId) {
       return Promise.reject(new Error("No IDs provided"));
     }
+
+    // Уникальный ключ кэша
     const cacheKey = malId ? `mal:${malId}` : `ann:${annId}`;
     if (nameItemRussianTitleCache.has(cacheKey)) {
       return nameItemRussianTitleCache.get(cacheKey);
     }
-    const url = new URL(`${API_BASE}/api/name-item`);
-    if (annId) url.searchParams.set("annId", String(annId));
-    if (malId) url.searchParams.set("malId", String(malId));
 
-    const lookup = requestJson(url.href).then(response => {
-      if (
-        (response?.malId !== undefined && response?.malId !== malId) ||
-        (response?.annId !== undefined && response?.annId !== annId) ||
-        (response?.animeRussian !== null && typeof response?.animeRussian !== "string") ||
-        !Array.isArray(response?.russianAliases) ||
-        response.russianAliases.some(alias => typeof alias !== "string")
-      ) {
-        throw new Error("Name item title API returned an invalid response");
+    // Внутренняя функция для выполнения конкретного запроса
+    const fetchVariant = async (params) => {
+      const url = new URL(`${API_BASE}/api/name-item`);
+      if (params.annId) url.searchParams.set("annId", String(params.annId));
+      if (params.malId) url.searchParams.set("malId", String(params.malId));
+
+      const response = await requestJson(url.href);
+
+      // Поддерживаем как camelCase (animeRussian), так и сырые имена из Mongo ("Anime Russian")
+      const russianTitle = response?.animeRussian || response?.russian || response?.["Anime Russian"];
+      const aliases = response?.russianAliases || response?.["Russian Alias"] || [];
+
+      if (russianTitle || (Array.isArray(aliases) && aliases.length > 0)) {
+        return {
+          animeRussian: typeof russianTitle === "string" ? russianTitle.trim() : null,
+          russianAliases: Array.isArray(aliases)
+            ? aliases.map(a => typeof a === "string" ? a.trim() : "").filter(Boolean)
+            : []
+        };
       }
-      return {
-        animeRussian: response.animeRussian?.trim() || null,
-        russianAliases: response.russianAliases
-          .map(alias => alias.trim())
-          .filter((alias, index, aliases) =>
-            alias && aliases.indexOf(alias) === index
-          )
-      };
-    });
+      return null; // Данные не найдены
+    };
+
+    const lookup = (async () => {
+      let result = null;
+
+      // 1. Пытаемся запросить сразу по обоим ID
+      if (annId && malId) {
+        try { result = await fetchVariant({ annId, malId }); } catch (e) {}
+      }
+      // 2. Если не вышло, пробуем только по MAL ID
+      if (!result && malId) {
+        try { result = await fetchVariant({ malId }); } catch (e) {}
+      }
+      // 3. Если не вышло, пробуем только по ANN ID
+      if (!result && annId) {
+        try { result = await fetchVariant({ annId }); } catch (e) {}
+      }
+
+      // Если совсем ничего не нашли, возвращаем пустоту без выброса ошибки
+      return result || { animeRussian: null, russianAliases: [] };
+    })();
+
     nameItemRussianTitleCache.set(cacheKey, lookup);
     lookup.catch(() => nameItemRussianTitleCache.delete(cacheKey));
     return lookup;
@@ -806,6 +830,7 @@
   let answerRound = 0;
   let selectionGeneration = 0;
   let lastQuery = "";
+  let lastRawQuery = "";
   let lastRenderedRequestId = -1;
   let lastRenderedQuery = "";
 
@@ -881,16 +906,18 @@
     answerRound++;
     hidePanel();
 
-    const annId = Number(data?.songInfo?.siteIds?.annId);
-    const malId = Number(data?.songInfo?.siteIds?.malId);
+    const rawAnnId = data?.songInfo?.siteIds?.annId;
+    const rawMalId = data?.songInfo?.siteIds?.malId;
+    const annId = (Number.isSafeInteger(rawAnnId) && rawAnnId > 0) ? rawAnnId : null;
+    const malId = (Number.isSafeInteger(rawMalId) && rawMalId > 0) ? rawMalId : null;
 
-    if (Number.isSafeInteger(annId) && annId > 0 && Number.isSafeInteger(malId) && malId > 0) {
+    if (annId && malId) {
       annIdToMalIdMap.set(annId, malId);
     }
 
     const currentRequest = ++activeAnswerTitleRequest;
     const container = document.querySelector("#qpAnimeNameContainer");
-    if (!container || (!Number.isSafeInteger(malId) && !Number.isSafeInteger(annId))) return;
+    if (!container || (!malId && !annId)) return;
 
     const tooltip = ensureAnswerRussianTitleTooltip(container);
 
@@ -958,7 +985,7 @@
       if (!malId) malId = annIdToMalIdMap.get(annId);
     }
 
-    return { annId, malId };
+    return { annId: annId || null, malId: malId || null };
   }
 
   function ensureSongHistoryRussianEntry(container) {
@@ -1283,6 +1310,7 @@
     mouseIndex = -1;
     currentResults = [];
     lastQuery = "";
+    lastRawQuery = "";
     lastRenderedRequestId = -1;
     lastRenderedQuery = "";
     requestId++;
@@ -1480,20 +1508,20 @@
     lastRenderedQuery = query;
   }
 
-  function renderSearchResults(animes, query, currentRequest, titleIndex) {
+  function renderSearchResults(animes, rawQuery, currentRequest, titleIndex) {
     if (!Array.isArray(animes)) return;
 
     const isCurrent = currentRequest === requestId;
     const isStaleRelevant =
       !isCurrent &&
-      query.length > 0 &&
-      lastQuery.length > query.length &&
-      lastQuery.startsWith(query);
+      rawQuery.length > 0 &&
+      lastRawQuery.length > rawQuery.length &&
+      lastRawQuery.startsWith(rawQuery);
     if (!isCurrent && !isStaleRelevant) return;
 
     if (currentRequest < lastRenderedRequestId) return;
 
-    const targetQuery = isCurrent ? query : lastQuery;
+    const targetQuery = isCurrent ? rawQuery : lastRawQuery;
 
     const bestResultByAmqTitle = new Map();
     const normalizedQuery = normalize(targetQuery);
@@ -1577,7 +1605,7 @@
     return score - normalizedTitle.length;
   }
 
-  function search(query, currentRequest) {
+  function search(rawQuery, currentRequest) {
     const titleIndex = getAmqTitleIndex();
     if (!titleIndex?.size) {
       showNotice("Список названий AMQ пока недоступен.");
@@ -1598,12 +1626,12 @@
       }
       renderSearchResults(
         [...accumulatedResults.values()],
-        query,
+        rawQuery,
         currentRequest,
         titleIndex
       );
     };
-    requestSearchCandidates(query, databaseResults => {
+    requestSearchCandidates(rawQuery, databaseResults => {
       addResults(databaseResults);
     })
       .then(animes => {
@@ -1700,7 +1728,9 @@
   document.addEventListener("input", event => {
     if (!event.target.matches("#qpAnswerInput")) return;
     clearTimeout(debounceTimer);
-    const query = event.target.value.trim();
+
+    const rawQuery = event.target.value;
+    const query = rawQuery.trim();
 
     const isRelated =
       query.length > 0 &&
@@ -1711,11 +1741,11 @@
       hidePanel();
     } else if (currentResults.length > 0) {
       const matchingResults = currentResults.filter(r =>
-        findTitleMatches(r.russian, query)
+        findTitleMatches(r.russian, rawQuery)
       );
 
       if (matchingResults.length > 0) {
-        showResults(matchingResults, query);
+        showResults(matchingResults, rawQuery);
       } else {
         panel.style.display = "none";
         keyboardIndex = -1;
@@ -1724,11 +1754,12 @@
     }
 
     lastQuery = query;
+    lastRawQuery = rawQuery;
     const currentRequest = ++requestId;
 
     if (query.length < 2 || !/[а-яё]/i.test(query)) return;
     debounceTimer = setTimeout(() => {
-      search(query, currentRequest);
+      search(rawQuery, currentRequest);
     }, SEARCH_DEBOUNCE_MS);
   });
 
