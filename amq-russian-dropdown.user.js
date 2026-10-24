@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         AMQ Russian Dropdown
-// @version      3.1.0
+// @version      3.1.1
 // @description
 // @author       denero
 // @match        https://animemusicquiz.com/*
@@ -46,10 +46,14 @@
   const searchResultCache = new Map();
   const compiledPatternCache = new Map();
 
+  const annIdToMalIdMap = new Map();
+  let lastKnownMalId = null;
+
   let amqTitlesCache = null;
   let amqTitlesCacheTimestamp = 0;
   let amqTitleIndexCache = null;
   let exactAmqTitleIndexCache = null;
+  let amqExactStringIndexCache = null;
 
   function normalize(value) {
     return String(value || "")
@@ -223,14 +227,19 @@
   }
 
   function hasUsableSearchMatch(animes, query) {
-    return animes.some(anime =>
-      anime?.russian &&
-      anime?.name &&
-      findTitleMatches(anime.russian, query)
-    );
+    return animes.some(anime => {
+      if (!anime?.russian || !anime?.name) return false;
+      const namesToCheck = [
+        anime.russian,
+        ...(Array.isArray(anime.russianAliases) ? anime.russianAliases : []),
+        ...(Array.isArray(anime.synonyms) ? anime.synonyms : [])
+      ];
+      return namesToCheck.some(name => typeof name === "string" && findTitleMatches(name, query));
+    });
   }
 
   function getAmqTitleMatchesForAnime(anime) {
+    const exactStringIndex = getAmqExactStringIndex();
     const exactTitleIndex = getExactAmqTitleIndex();
     const titleGroups = [
       {
@@ -257,12 +266,24 @@
     for (const group of titleGroups) {
       for (const name of group.names) {
         if (typeof name !== "string") continue;
+
+        const exactStringMatch = exactStringIndex?.get(name.toLowerCase());
+        if (exactStringMatch) {
+          const key = normalizeAmqTitle(exactStringMatch.value);
+          const current = matches.get(key);
+          if (!current || group.priority > current.priority || (group.priority === current.priority && exactStringMatch.value.length > current.value.length)) {
+            matches.set(key, { ...exactStringMatch, priority: group.priority });
+          }
+          continue;
+        }
+
         const exactMatch = exactTitleIndex?.get(normalizeAmqTitle(name));
-        if (!exactMatch) continue;
-        const key = normalizeAmqTitle(exactMatch.value);
-        const current = matches.get(key);
-        if (!current || group.priority > current.priority) {
-          matches.set(key, { ...exactMatch, priority: group.priority });
+        if (exactMatch) {
+          const key = normalizeAmqTitle(exactMatch.value);
+          const current = matches.get(key);
+          if (!current || group.priority > current.priority || (group.priority === current.priority && exactMatch.value.length > current.value.length)) {
+            matches.set(key, { ...exactMatch, priority: group.priority });
+          }
         }
       }
     }
@@ -296,11 +317,13 @@
           throw new Error("Shikimori search response is not an array");
         }
         for (const anime of response) {
-          if (
-            Number.isSafeInteger(anime?.id) &&
-            typeof anime?.russian === "string" &&
-            findTitleMatches(anime.russian, query)
-          ) {
+          if (!Number.isSafeInteger(anime?.id)) continue;
+          const namesToCheck = [
+            anime.russian,
+            anime.name,
+            ...(Array.isArray(anime.synonyms) ? anime.synonyms : [])
+          ].filter(n => typeof n === "string");
+          if (namesToCheck.some(name => findTitleMatches(name, query))) {
             candidates.set(anime.id, anime);
           }
         }
@@ -356,11 +379,15 @@
           continue;
         }
         const anime = extractShikimoriAnime(response.value);
-        if (
-          !anime ||
-          typeof anime.russian !== "string" ||
-          !findTitleMatches(anime.russian, query)
-        ) {
+        if (!anime || typeof anime.russian !== "string") {
+          continue;
+        }
+        const detailNamesToCheck = [
+          anime.russian,
+          anime.name,
+          ...(Array.isArray(anime.synonyms) ? anime.synonyms : [])
+        ].filter(n => typeof n === "string");
+        if (!detailNamesToCheck.some(name => findTitleMatches(name, query))) {
           continue;
         }
         const amqTitles = getAmqTitleMatchesForAnime(anime);
@@ -597,6 +624,7 @@
     amqTitlesCacheTimestamp = now;
     amqTitleIndexCache = null;
     exactAmqTitleIndexCache = null;
+    amqExactStringIndexCache = null;
     return amqTitlesCache;
   }
 
@@ -626,6 +654,19 @@
     }
     exactAmqTitleIndexCache = index;
     return exactAmqTitleIndexCache;
+  }
+
+  function getAmqExactStringIndex() {
+    if (amqExactStringIndexCache) return amqExactStringIndexCache;
+    const titles = getAmqTitles();
+    if (!titles.length) return null;
+    const index = new Map();
+    for (const item of titles) {
+      const key = item.value.toLowerCase();
+      if (key && !index.has(key)) index.set(key, item);
+    }
+    amqExactStringIndexCache = index;
+    return amqExactStringIndexCache;
   }
 
   function requestJson(url, options = {}) {
@@ -682,18 +723,17 @@
     return Array.isArray(response) ? response[0] : response;
   }
 
-  function requestNameItemRussianTitle(annId) {
-    const cacheKey = `ann:${annId}`;
+  function requestNameItemRussianTitle(malId) {
+    const cacheKey = `mal:${malId}`;
     if (nameItemRussianTitleCache.has(cacheKey)) {
       return nameItemRussianTitleCache.get(cacheKey);
     }
     const url = new URL(`${API_BASE}/api/name-item`);
-    url.searchParams.set("annId", String(annId));
+    url.searchParams.set("malId", String(malId));
     const lookup = requestJson(url.href).then(response => {
       if (
-        response?.annId !== annId ||
-        (response?.animeRussian !== null &&
-          typeof response?.animeRussian !== "string") ||
+        (response?.malId !== undefined && response?.malId !== malId) ||
+        (response?.animeRussian !== null && typeof response?.animeRussian !== "string") ||
         !Array.isArray(response?.russianAliases) ||
         response.russianAliases.some(alias => typeof alias !== "string")
       ) {
@@ -835,14 +875,24 @@
   function handleAnswerResults(data) {
     answerRound++;
     hidePanel();
-    const currentRequest = ++activeAnswerTitleRequest;
+
     const annId = Number(data?.songInfo?.siteIds?.annId);
+    const malId = Number(data?.songInfo?.siteIds?.malId);
+
+    if (Number.isSafeInteger(annId) && annId > 0 && Number.isSafeInteger(malId) && malId > 0) {
+      annIdToMalIdMap.set(annId, malId);
+    }
+    if (Number.isSafeInteger(malId) && malId > 0) {
+      lastKnownMalId = malId;
+    }
+
+    const currentRequest = ++activeAnswerTitleRequest;
     const container = document.querySelector("#qpAnimeNameContainer");
-    if (!container || !Number.isSafeInteger(annId) || annId < 1) return;
+    if (!container || !Number.isSafeInteger(malId) || malId < 1) return;
     const tooltip = ensureAnswerRussianTitleTooltip(container);
     setAnswerRussianTitle(tooltip, "Загружаю русское название из базы…");
     tooltip.style.display = "none";
-    requestNameItemRussianTitle(annId)
+    requestNameItemRussianTitle(malId)
       .then(result => {
         if (currentRequest !== activeAnswerTitleRequest || !container.isConnected) {
           return;
@@ -874,14 +924,30 @@
     return true;
   }
 
-  function getSongHistoryAnnId(container) {
-    const anchor = container.querySelector(
-      "#shiAnnId[href], #shiAnnId a[href]"
+  function getSongHistoryMalId(container) {
+    const malAnchor = container.querySelector(
+      "#shiMalId[href], #shiMalId a[href], a[href*='myanimelist.net/anime/']"
     );
-    const hrefMatch = anchor?.href.match(/anime\.php\?id=(\d+)/i);
-    const textMatch = anchor?.textContent.match(/\d+/);
-    const annId = Number(hrefMatch?.[1] || textMatch?.[0]);
-    return Number.isSafeInteger(annId) && annId > 0 ? annId : null;
+    if (malAnchor) {
+      const hrefMatch = malAnchor.href.match(/myanimelist\.net\/anime\/(\d+)/i);
+      const textMatch = malAnchor.textContent.match(/\d+/);
+      const malId = Number(hrefMatch?.[1] || textMatch?.[0]);
+      if (Number.isSafeInteger(malId) && malId > 0) return malId;
+    }
+
+    const annAnchor = container.querySelector(
+      "#shiAnnId[href], #shiAnnId a[href], a[href*='animenewsnetwork.com/encyclopedia/anime.php?id=']"
+    );
+    if (annAnchor) {
+      const hrefMatch = annAnchor.href.match(/id=(\d+)/i);
+      const textMatch = annAnchor.textContent.match(/\d+/);
+      const annId = Number(hrefMatch?.[1] || textMatch?.[0]);
+      if (Number.isSafeInteger(annId) && annId > 0 && annIdToMalIdMap.has(annId)) {
+        return annIdToMalIdMap.get(annId);
+      }
+    }
+
+    return lastKnownMalId;
   }
 
   function ensureSongHistoryRussianEntry(container) {
@@ -961,9 +1027,9 @@
     const containers = [...document.querySelectorAll(".shiEntryContainer")];
     const targetContainer = containers[0] || null;
 
-    const annId = targetContainer
-      ? getSongHistoryAnnId(targetContainer) ||
-        containers.map(getSongHistoryAnnId).find(Boolean) ||
+    const malId = targetContainer
+      ? getSongHistoryMalId(targetContainer) ||
+        containers.map(getSongHistoryMalId).find(Boolean) ||
         null
       : null;
 
@@ -993,7 +1059,7 @@
       label.textContent = labelText;
     }
 
-    if (!annId) {
+    if (!malId) {
       aliasesContainer
         ?.querySelectorAll("[data-amq-russian-alias], [data-amq-russian-title]")
         .forEach(value => value.remove());
@@ -1001,7 +1067,7 @@
       return;
     }
 
-    const lookupKey = `ann:${annId}`;
+    const lookupKey = `mal:${malId}`;
     if (
       value.dataset.lookupKey === lookupKey &&
       (
@@ -1016,7 +1082,7 @@
     if (value.textContent !== "Загрузка…") {
       value.textContent = "Загрузка…";
     }
-    requestNameItemRussianTitle(annId)
+    requestNameItemRussianTitle(malId)
       .then(result => {
         if (value.dataset.lookupKey !== lookupKey) return;
         const russianTitle = result.animeRussian || "Нет в базе";
@@ -1358,7 +1424,6 @@
 
   function showResults(results, query) {
     const isSameResults = results.length === currentResults.length && results.every((r, i) => r.amqValue === currentResults[i].amqValue);
-    // Если результаты не изменились и текст тот же, и панель открыта — не перерисовываем DOM
     if (isSameResults && lastRenderedQuery === query && panel.style.display !== "none") {
       return;
     }
@@ -1432,27 +1497,38 @@
 
     if (currentRequest < lastRenderedRequestId) return;
 
-    // Всегда используем актуальный текст из поля ввода для фильтрации и подсветки
     const targetQuery = isCurrent ? query : lastQuery;
 
     const bestResultByAmqTitle = new Map();
     const normalizedQuery = normalize(targetQuery);
     for (const anime of animes) {
       if (!anime?.russian || !anime?.name) continue;
-      if (!findTitleMatches(anime.russian, targetQuery)) continue;
+
+      const namesToCheck = [
+        anime.russian,
+        ...(Array.isArray(anime.russianAliases) ? anime.russianAliases : []),
+        ...(Array.isArray(anime.synonyms) ? anime.synonyms : [])
+      ];
+
+      const matchedName = namesToCheck.find(name => typeof name === "string" && findTitleMatches(name, targetQuery));
+      if (!matchedName) continue;
+
+      const exactStringMatch = typeof anime.name === 'string' ? getAmqExactStringIndex()?.get(anime.name.toLowerCase()) : null;
       const match =
         getAmqTitleMatchForAnime(anime) ||
+        exactStringMatch ||
         getExactAmqTitleIndex()?.get(normalizeAmqTitle(anime.name)) ||
         titleIndex.get(normalize(anime.name)) ||
         { value: anime.name, label: anime.name };
+
       const result = {
         id: anime.id,
         malId: Number(anime.malId) || null,
-        russian: anime.russian,
+        russian: matchedName,
         amqTitle: anime.preferredTitle || anime.name || match.label,
         amqValue: match.value,
         titlePriority: Number(anime.titlePriority) || 0,
-        relevance: getSearchResultRelevance(anime.russian, normalizedQuery)
+        relevance: getSearchResultRelevance(matchedName, normalizedQuery)
       };
       const key = normalizeAmqTitle(match.value);
       const current = bestResultByAmqTitle.get(key);
@@ -1628,8 +1704,6 @@
     if (!isRelated) {
       hidePanel();
     } else if (currentResults.length > 0) {
-      // Мгновенная локальная фильтрация: проверяем, соответствуют ли текущие результаты
-      // новому вводу. Если нет (опечатка) — панель прячется.
       const matchingResults = currentResults.filter(r =>
         findTitleMatches(r.russian, query)
       );
