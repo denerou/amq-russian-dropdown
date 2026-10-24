@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         AMQ Russian Dropdown
-// @version      3.1.2
+// @version      3.1.3
 // @description
 // @author       denero
 // @match        https://animemusicquiz.com/*
@@ -45,9 +45,8 @@
   const confirmedDiscoveredMalIds = new Set();
   const searchResultCache = new Map();
   const compiledPatternCache = new Map();
-  
+
   const annIdToMalIdMap = new Map();
-  let lastKnownMalId = null;
 
   let amqTitlesCache = null;
   let amqTitlesCacheTimestamp = 0;
@@ -723,16 +722,22 @@
     return Array.isArray(response) ? response[0] : response;
   }
 
-  function requestNameItemRussianTitle(malId) {
-    const cacheKey = `mal:${malId}`;
+  function requestNameItemRussianTitle(annId, malId) {
+    if (!annId && !malId) {
+      return Promise.reject(new Error("No IDs provided"));
+    }
+    const cacheKey = malId ? `mal:${malId}` : `ann:${annId}`;
     if (nameItemRussianTitleCache.has(cacheKey)) {
       return nameItemRussianTitleCache.get(cacheKey);
     }
     const url = new URL(`${API_BASE}/api/name-item`);
-    url.searchParams.set("malId", String(malId));
+    if (annId) url.searchParams.set("annId", String(annId));
+    if (malId) url.searchParams.set("malId", String(malId));
+
     const lookup = requestJson(url.href).then(response => {
       if (
         (response?.malId !== undefined && response?.malId !== malId) ||
+        (response?.annId !== undefined && response?.annId !== annId) ||
         (response?.animeRussian !== null && typeof response?.animeRussian !== "string") ||
         !Array.isArray(response?.russianAliases) ||
         response.russianAliases.some(alias => typeof alias !== "string")
@@ -875,29 +880,25 @@
   function handleAnswerResults(data) {
     answerRound++;
     hidePanel();
-    
+
     const annId = Number(data?.songInfo?.siteIds?.annId);
     const malId = Number(data?.songInfo?.siteIds?.malId);
-    
+
     if (Number.isSafeInteger(annId) && annId > 0 && Number.isSafeInteger(malId) && malId > 0) {
       annIdToMalIdMap.set(annId, malId);
-    }
-    if (Number.isSafeInteger(malId) && malId > 0) {
-      lastKnownMalId = malId;
     }
 
     const currentRequest = ++activeAnswerTitleRequest;
     const container = document.querySelector("#qpAnimeNameContainer");
-    if (!container || !Number.isSafeInteger(malId) || malId < 1) return;
-    
+    if (!container || (!Number.isSafeInteger(malId) && !Number.isSafeInteger(annId))) return;
+
     const tooltip = ensureAnswerRussianTitleTooltip(container);
-    
-    // Не показываем "Загружаю...", а просто очищаем. Если данных нет — тултип не появится при наведении.
+
     const content = tooltip.querySelector(".amqAnswerRussianTitleText");
     if (content) content.textContent = "";
     tooltip.style.display = "none";
 
-    requestNameItemRussianTitle(malId)
+    requestNameItemRussianTitle(annId, malId)
       .then(result => {
         if (currentRequest !== activeAnswerTitleRequest || !container.isConnected) {
           return;
@@ -929,30 +930,35 @@
     return true;
   }
 
-  function getSongHistoryMalId(container) {
+  function getSongHistoryIds(container) {
+    let annId = null;
+    let malId = null;
+
     const malAnchor = container.querySelector(
-      "#shiMalId[href], #shiMalId a[href], a[href*='myanimelist.net/anime/']"
+      "a[href*='myanimelist.net/anime/']"
     );
     if (malAnchor) {
       const hrefMatch = malAnchor.href.match(/myanimelist\.net\/anime\/(\d+)/i);
       const textMatch = malAnchor.textContent.match(/\d+/);
-      const malId = Number(hrefMatch?.[1] || textMatch?.[0]);
-      if (Number.isSafeInteger(malId) && malId > 0) return malId;
+      const parsed = Number(hrefMatch?.[1] || textMatch?.[0]);
+      if (Number.isSafeInteger(parsed) && parsed > 0) malId = parsed;
     }
 
     const annAnchor = container.querySelector(
-      "#shiAnnId[href], #shiAnnId a[href], a[href*='animenewsnetwork.com/encyclopedia/anime.php?id=']"
+      "a[href*='animenewsnetwork.com/encyclopedia/anime.php?id=']"
     );
     if (annAnchor) {
       const hrefMatch = annAnchor.href.match(/id=(\d+)/i);
       const textMatch = annAnchor.textContent.match(/\d+/);
-      const annId = Number(hrefMatch?.[1] || textMatch?.[0]);
-      if (Number.isSafeInteger(annId) && annId > 0 && annIdToMalIdMap.has(annId)) {
-        return annIdToMalIdMap.get(annId);
-      }
+      const parsed = Number(hrefMatch?.[1] || textMatch?.[0]);
+      if (Number.isSafeInteger(parsed) && parsed > 0) annId = parsed;
     }
 
-    return lastKnownMalId;
+    if (annId && annIdToMalIdMap.has(annId)) {
+      if (!malId) malId = annIdToMalIdMap.get(annId);
+    }
+
+    return { annId, malId };
   }
 
   function ensureSongHistoryRussianEntry(container) {
@@ -986,125 +992,110 @@
     return value;
   }
 
-  function renderRussianAliases(entry, aliases, mainRussianTitle) {
-    const signature = JSON.stringify([mainRussianTitle, aliases]);
-    if (entry.dataset.amqRussianAliasesKey === signature) return;
-
-    entry.querySelectorAll("[data-amq-russian-alias], [data-amq-russian-title]").forEach(v => v.remove());
-
-    let multiRow = entry.querySelector(".shiEntryMultiRow");
-    if (!multiRow) {
-      multiRow = document.createElement("div");
-      multiRow.className = "shiEntryMultiRow";
-      entry.appendChild(multiRow);
-    }
-
-    if (mainRussianTitle) {
-      const value = document.createElement("div");
-      value.className = "shiEntryValue";
-      value.dataset.amqRussianTitle = "true";
-      value.textContent = mainRussianTitle;
-      multiRow.appendChild(value);
-    }
-
-    for (const alias of aliases) {
-      const value = document.createElement("div");
-      value.className = "shiEntryValue";
-      value.dataset.amqRussianAlias = "true";
-      value.textContent = alias;
-      multiRow.appendChild(value);
-    }
-
-    entry.dataset.amqRussianAliasesKey = signature;
-  }
-
-  function findAliasesContainer(containers) {
-    return containers[2] || null;
-  }
-
   function updateSongHistoryRussianTitles() {
-    const languageText =
-      document.querySelector("#smLanguageCurrentText")?.textContent.trim() || "";
-    const labelText = languageText === "Русский язык"
-      ? "Название (рус.)"
-      : "Anime Russian";
-
     const containers = [...document.querySelectorAll(".shiEntryContainer")];
-    const targetContainer = containers[0] || null;
+    if (!containers.length) return;
 
-    const malId = targetContainer
-      ? getSongHistoryMalId(targetContainer) ||
-        containers.map(getSongHistoryMalId).find(Boolean) ||
-        null
-      : null;
+    const allIds = containers.map(getSongHistoryIds);
+    const ids = {
+      annId: allIds.find(i => i.annId)?.annId || null,
+      malId: allIds.find(i => i.malId)?.malId || null
+    };
 
-    const aliasesContainer = findAliasesContainer(containers);
-    const aliasesEntry = aliasesContainer?.querySelector(".shiEntry") || null;
-
-    for (const container of containers) {
-      if (container !== targetContainer) {
-        container.querySelectorAll("#shiAnimeRussianTitle").forEach(entry => {
-          entry.closest(".shiEntry")?.remove();
-        });
-      }
-      if (container !== aliasesContainer) {
-        container
-          .querySelectorAll("[data-amq-russian-alias], [data-amq-russian-title]")
-          .forEach(value => value.remove());
-      }
-    }
-
-    if (!targetContainer) return;
-
-    const value = ensureSongHistoryRussianEntry(targetContainer);
-    const label = value.parentElement?.querySelector(
-      '[data-i18n="song_history.song_window.anime_russian"]'
-    );
-    if (label && label.textContent !== labelText) {
-      label.textContent = labelText;
-    }
-
-    if (!malId) {
-      aliasesContainer
-        ?.querySelectorAll("[data-amq-russian-alias], [data-amq-russian-title]")
-        .forEach(value => value.remove());
-      if (aliasesEntry) delete aliasesEntry.dataset.amqRussianAliasesKey;
+    if (!ids.annId && !ids.malId) {
+      document.querySelectorAll("#shiAnimeRussianTitle").forEach(el => el.closest(".shiEntry").remove());
+      document.querySelectorAll("[data-amq-russian-title], [data-amq-russian-alias]").forEach(el => el.remove());
+      if (containers[0]) delete containers[0].dataset.amqLoadedMal;
+      if (containers[2]) delete containers[2].dataset.amqLoadedMal;
       return;
     }
 
-    const lookupKey = `mal:${malId}`;
-    if (
-      value.dataset.lookupKey === lookupKey &&
-      (
-        !aliasesEntry ||
-        aliasesEntry.dataset.amqRussianAliasesKey !== undefined
-      )
-    ) {
-      return;
+    const lookupKey = ids.malId ? `mal:${ids.malId}` : `ann:${ids.annId}`;
+    const mainContainer = containers[0];
+    const targetContainer = containers[2];
+
+    const isMainLoaded = mainContainer && mainContainer.querySelector("#shiAnimeRussianTitle")?.dataset.loadedMal === lookupKey;
+    const targetEntry = targetContainer ? targetContainer.querySelector(".shiEntry") : null;
+    const isTargetLoaded = targetEntry && targetEntry.dataset.amqTargetLoadedMal === lookupKey;
+
+    if (isMainLoaded && isTargetLoaded) return;
+
+    if (mainContainer) {
+      const mainValue = ensureSongHistoryRussianEntry(mainContainer);
+      const label = mainValue.parentElement?.querySelector(
+        '[data-i18n="song_history.song_window.anime_russian"]'
+      );
+      const languageText = document.querySelector("#smLanguageCurrentText")?.textContent.trim() || "";
+      const labelText = languageText === "Русский язык" ? "Название (рус.)" : "Anime Russian";
+      if (label && label.textContent !== labelText) label.textContent = labelText;
+
+      if (mainValue.dataset.loadedMal !== lookupKey) {
+        if (mainValue.textContent !== "Загрузка…") mainValue.textContent = "Загрузка…";
+      }
     }
 
-    value.dataset.lookupKey = lookupKey;
-    if (value.textContent !== "Загрузка…") {
-      value.textContent = "Загрузка…";
+    let targetMultiRow = null;
+    if (targetEntry) {
+      targetMultiRow = targetEntry.querySelector(".shiEntryMultiRow");
+      if (!targetMultiRow) {
+        targetMultiRow = document.createElement("div");
+        targetMultiRow.className = "shiEntryMultiRow";
+        targetEntry.appendChild(targetMultiRow);
+      }
     }
-    requestNameItemRussianTitle(malId)
+
+    if (mainContainer) {
+      const mainValue = mainContainer.querySelector("#shiAnimeRussianTitle");
+      if (mainValue && mainValue.dataset.isLoading === "true" && mainValue.dataset.loadingMal === lookupKey) {
+        return;
+      }
+      if (mainValue) {
+        mainValue.dataset.isLoading = "true";
+        mainValue.dataset.loadingMal = lookupKey;
+      }
+    }
+
+    requestNameItemRussianTitle(ids.annId, ids.malId)
       .then(result => {
-        if (value.dataset.lookupKey !== lookupKey) return;
-        const russianTitle = result.animeRussian || "Нет в базе";
-        if (value.textContent !== russianTitle) {
-          value.textContent = russianTitle;
+        if (mainContainer) {
+          const mainValue = mainContainer.querySelector("#shiAnimeRussianTitle");
+          if (mainValue) {
+            mainValue.dataset.isLoading = "false";
+            mainValue.dataset.loadedMal = lookupKey;
+            mainValue.textContent = result.animeRussian || "Нет в базе";
+          }
         }
-        if (aliasesEntry) {
-          renderRussianAliases(aliasesEntry, result.russianAliases, result.animeRussian);
+
+        if (targetEntry && targetMultiRow) {
+          targetEntry.dataset.amqTargetLoadedMal = lookupKey;
+          targetMultiRow.querySelectorAll("[data-amq-russian-title], [data-amq-russian-alias]").forEach(el => el.remove());
+
+          if (result.animeRussian) {
+            const div = document.createElement("div");
+            div.className = "shiEntryValue";
+            div.dataset.amqRussianTitle = "true";
+            div.textContent = result.animeRussian;
+            targetMultiRow.appendChild(div);
+          }
+
+          for (const alias of result.russianAliases) {
+            const div = document.createElement("div");
+            div.className = "shiEntryValue";
+            div.dataset.amqRussianAlias = "true";
+            div.textContent = alias;
+            targetMultiRow.appendChild(div);
+          }
         }
       })
       .catch(error => {
-        if (value.dataset.lookupKey !== lookupKey) return;
-        console.error(
-          `[AMQ Russian Dropdown] Could not load the Russian title for ${lookupKey}.`,
-          error
-        );
-        value.textContent = "Ошибка загрузки";
+        if (mainContainer) {
+          const mainValue = mainContainer.querySelector("#shiAnimeRussianTitle");
+          if (mainValue) {
+            mainValue.dataset.isLoading = "false";
+            mainValue.textContent = "Ошибка загрузки";
+          }
+        }
+        console.error("[AMQ Russian Dropdown] Could not load titles:", error);
       });
   }
 
@@ -1508,8 +1499,7 @@
     const normalizedQuery = normalize(targetQuery);
     for (const anime of animes) {
       if (!anime?.russian || !anime?.name) continue;
-      
-      // Предзаполняем кэш русских названий и алиасов (если API вернуло их в поиске)
+
       if (anime.malId && !nameItemRussianTitleCache.has(`mal:${anime.malId}`)) {
         const aliases = Array.isArray(anime.russianAliases) ? anime.russianAliases : [];
         if (anime.russian || aliases.length > 0) {
@@ -1519,13 +1509,13 @@
           }));
         }
       }
-      
+
       const namesToCheck = [
         anime.russian,
         ...(Array.isArray(anime.russianAliases) ? anime.russianAliases : []),
         ...(Array.isArray(anime.synonyms) ? anime.synonyms : [])
       ];
-      
+
       const matchedName = namesToCheck.find(name => typeof name === "string" && findTitleMatches(name, targetQuery));
       if (!matchedName) continue;
 
@@ -1773,6 +1763,7 @@
       clearInterval(answerTitleListenerInterval);
     }
   }, 500);
+
   let songHistoryUpdateFrame = 0;
   const songHistoryObserver = new MutationObserver(records => {
     const isGeneratedNode = node =>
@@ -1781,36 +1772,32 @@
         node.matches("#shiAnimeRussianTitle, [data-amq-russian-alias], [data-amq-russian-title]") ||
         node.querySelector("#shiAnimeRussianTitle, [data-amq-russian-alias], [data-amq-russian-title]")
       );
-    const hasRelevantInsertion = records.some(record => {
-      const insideContainer = record.target.parentElement?.closest(
-        ".shiEntryContainer"
-      ) || record.target.closest?.(".shiEntryContainer");
-      if (insideContainer) {
-        if (
-          record.target.parentElement?.closest("#shiAnimeRussianTitle, [data-amq-russian-alias], [data-amq-russian-title]") ||
-          record.target.closest?.("#shiAnimeRussianTitle, [data-amq-russian-alias], [data-amq-russian-title]")
-        ) {
-          return false;
-        }
-        return [...record.addedNodes].some(node => !isGeneratedNode(node));
+
+    const isRelevantChange = records.some(record => {
+      if (record.target.nodeType === Node.ELEMENT_NODE &&
+          (record.target.matches("#shiAnimeRussianTitle, [data-amq-russian-alias], [data-amq-russian-title]") ||
+           record.target.closest("#shiAnimeRussianTitle, [data-amq-russian-alias], [data-amq-russian-title]"))) {
+        return false;
       }
-      return [...record.addedNodes].some(node =>
-        node.nodeType === Node.ELEMENT_NODE &&
-        (
-          node.matches(".shiEntryContainer") ||
-          node.querySelector(".shiEntryContainer")
-        )
-      );
+      if (record.type === "attributes" && record.attributeName === "href") {
+        return true;
+      }
+      return [...record.addedNodes].some(node => !isGeneratedNode(node));
     });
-    if (!hasRelevantInsertion || songHistoryUpdateFrame) return;
+
+    if (!isRelevantChange || songHistoryUpdateFrame) return;
     songHistoryUpdateFrame = requestAnimationFrame(() => {
       songHistoryUpdateFrame = 0;
       updateSongHistoryRussianTitles();
     });
   });
+
   songHistoryObserver.observe(document.body, {
     childList: true,
-    subtree: true
+    subtree: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: ["href"]
   });
 
   const SCRIPT_CSS = `
