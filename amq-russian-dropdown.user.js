@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         AMQ Russian Dropdown
-// @version      3.3
+// @version      3.4.0
 // @description
 // @author       denero
 // @match        https://animemusicquiz.com/*
@@ -45,7 +45,7 @@
   const confirmedDiscoveredMalIds = new Set();
   const searchResultCache = new Map();
   const compiledPatternCache = new Map();
-
+  
   const annIdToMalIdMap = new Map();
 
   let amqTitlesCache = null;
@@ -691,8 +691,9 @@
         timeout: 8000,
         onload(response) {
           if (response.status < 200 || response.status >= 300) {
+            const errorText = response.responseText ? `: ${response.responseText.substring(0, 50)}` : "";
             const error = new Error(
-              `${new URL(url).hostname} returned HTTP ${response.status}`
+              `${new URL(url).hostname} returned HTTP ${response.status}${errorText}`
             );
             error.statusCode = response.status;
             reject(error);
@@ -736,7 +737,7 @@
     if (!annId && !malId) {
       return Promise.reject(new Error("No IDs provided"));
     }
-
+    
     const cacheKey = malId ? `mal:${malId}` : `ann:${annId}`;
     if (nameItemRussianTitleCache.has(cacheKey)) {
       return nameItemRussianTitleCache.get(cacheKey);
@@ -746,17 +747,17 @@
       const url = new URL(`${API_BASE}/api/name-item`);
       if (params.annId) url.searchParams.set("annId", String(params.annId));
       if (params.malId) url.searchParams.set("malId", String(params.malId));
-
+      
       const response = await requestJson(url.href);
       const data = Array.isArray(response) ? response[0] : response;
-
+      
       const russianTitle = data?.["Anime Russian"] || data?.animeRussian || data?.russian;
       const aliases = data?.["Russian Alias"] || data?.russianAliases || [];
-
+      
       if (russianTitle || (Array.isArray(aliases) && aliases.length > 0)) {
         return {
           animeRussian: typeof russianTitle === "string" ? russianTitle.trim() : null,
-          russianAliases: Array.isArray(aliases)
+          russianAliases: Array.isArray(aliases) 
             ? aliases.map(a => typeof a === "string" ? a.trim() : "").filter(Boolean)
             : []
         };
@@ -766,7 +767,7 @@
 
     const lookup = (async () => {
       let result = null;
-
+      
       if (annId && malId) {
         try { result = await fetchVariant({ annId, malId }); } catch (e) {}
       }
@@ -852,6 +853,56 @@
     });
   }
 
+  async function autoAddAnimeToDatabase(malId, annId, romaji, english, tooltip, container, currentRequest) {
+    if (!malId) {
+      setAnswerRussianTitle(tooltip, "Ошибка: нет MAL ID");
+      return;
+    }
+
+    setAnswerRussianTitle(tooltip, "Добавление в базу...");
+    if (container.matches(":hover")) {
+      showAnswerRussianTitleTooltip(container, tooltip);
+    }
+
+    try {
+      const response = await requestJsonWithRetry(`${API_BASE}/api/manual-add`, {
+        method: "POST",
+        body: JSON.stringify({
+          MALid: malId,
+          ANNid: annId,
+          "Anime English": english,
+          "Anime Romaji": romaji
+        })
+      });
+
+      if (currentRequest !== activeAnswerTitleRequest || !container.isConnected) {
+        return;
+      }
+
+      if (response && response.ok) {
+        if (response.russian) {
+          setAnswerRussianTitle(tooltip, response.russian, []);
+          nameItemRussianTitleCache.set(`mal:${malId}`, Promise.resolve({
+            animeRussian: response.russian,
+            russianAliases: []
+          }));
+        } else {
+          setAnswerRussianTitle(tooltip, "Добавлено (нет перевода)");
+        }
+      } else {
+        throw new Error("API rejected the data");
+      }
+    } catch (error) {
+      if (currentRequest !== activeAnswerTitleRequest) return;
+      console.error("[AMQ Russian Dropdown] Auto-add error:", error);
+      setAnswerRussianTitle(tooltip, "Ошибка авто-добавления");
+    }
+
+    if (container.matches(":hover")) {
+      showAnswerRussianTitleTooltip(container, tooltip);
+    }
+  }
+
   function showAnswerRussianTitleTooltip(container, tooltip) {
     tooltip.style.display = "flex";
     const containerRect = container.getBoundingClientRect();
@@ -908,12 +959,16 @@
   function handleAnswerResults(data) {
     answerRound++;
     hidePanel();
-
+    
     const rawAnnId = data?.songInfo?.siteIds?.annId;
     const rawMalId = data?.songInfo?.siteIds?.malId;
     const annId = (Number.isSafeInteger(rawAnnId) && rawAnnId > 0) ? rawAnnId : null;
     const malId = (Number.isSafeInteger(rawMalId) && rawMalId > 0) ? rawMalId : null;
-
+    
+    const animeNames = data?.songInfo?.animeNames || {};
+    const romaji = animeNames.romaji || "";
+    const english = animeNames.english || "";
+    
     if (annId && malId) {
       annIdToMalIdMap.set(annId, malId);
     }
@@ -921,9 +976,9 @@
     const currentRequest = ++activeAnswerTitleRequest;
     const container = document.querySelector("#qpAnimeNameContainer");
     if (!container || (!malId && !annId)) return;
-
+    
     const tooltip = ensureAnswerRussianTitleTooltip(container);
-
+    
     const content = tooltip.querySelector(".amqAnswerRussianTitleText");
     if (content) content.textContent = "";
     tooltip.style.display = "none";
@@ -933,21 +988,24 @@
         if (currentRequest !== activeAnswerTitleRequest || !container.isConnected) {
           return;
         }
-        setAnswerRussianTitle(
-          tooltip,
-          result.animeRussian,
-          result.russianAliases
-        );
+        
+        if (result.animeRussian || result.russianAliases.length > 0) {
+            // Если нашли в базе
+            setAnswerRussianTitle(tooltip, result.animeRussian, result.russianAliases);
+        } else {
+            // Если не нашли — запускаем авто-добавление
+            autoAddAnimeToDatabase(malId, annId, romaji, english, tooltip, container, currentRequest);
+            return; 
+        }
+        
         if (container.matches(":hover")) {
           showAnswerRussianTitleTooltip(container, tooltip);
         }
       })
       .catch(error => {
         if (currentRequest !== activeAnswerTitleRequest) return;
-        setAnswerRussianTitle(tooltip, `Ошибка загрузки: ${error.message}`);
-        if (container.matches(":hover")) {
-          showAnswerRussianTitleTooltip(container, tooltip);
-        }
+        // При ошибке тоже пробуем авто-добавить
+        autoAddAnimeToDatabase(malId, annId, romaji, english, tooltip, container, currentRequest);
       });
   }
 
@@ -1536,7 +1594,7 @@
         ...(Array.isArray(anime.russianAliases) ? anime.russianAliases : []),
         ...(Array.isArray(anime.synonyms) ? anime.synonyms : [])
       ];
-
+      
       const matchedName = namesToCheck.find(name => typeof name === "string" && findTitleMatches(name, targetQuery));
       if (!matchedName) continue;
 
@@ -1721,7 +1779,7 @@
   document.addEventListener("input", event => {
     if (!event.target.matches("#qpAnswerInput")) return;
     clearTimeout(debounceTimer);
-
+    
     const rawQuery = event.target.value;
     const query = rawQuery.trim();
 
@@ -1787,7 +1845,7 @@
       clearInterval(answerTitleListenerInterval);
     }
   }, 500);
-
+  
   let songHistoryUpdateFrame = 0;
   const songHistoryObserver = new MutationObserver(records => {
     const isGeneratedNode = node =>
@@ -1796,10 +1854,10 @@
         node.matches("#shiAnimeRussianTitle, [data-amq-russian-alias], [data-amq-russian-title]") ||
         node.querySelector("#shiAnimeRussianTitle, [data-amq-russian-alias], [data-amq-russian-title]")
       );
-
+      
     const isRelevantChange = records.some(record => {
-      if (record.target.nodeType === Node.ELEMENT_NODE &&
-          (record.target.matches("#shiAnimeRussianTitle, [data-amq-russian-alias], [data-amq-russian-title]") ||
+      if (record.target.nodeType === Node.ELEMENT_NODE && 
+          (record.target.matches("#shiAnimeRussianTitle, [data-amq-russian-alias], [data-amq-russian-title]") || 
            record.target.closest("#shiAnimeRussianTitle, [data-amq-russian-alias], [data-amq-russian-title]"))) {
         return false;
       }
@@ -1808,14 +1866,14 @@
       }
       return [...record.addedNodes].some(node => !isGeneratedNode(node));
     });
-
+    
     if (!isRelevantChange || songHistoryUpdateFrame) return;
     songHistoryUpdateFrame = requestAnimationFrame(() => {
       songHistoryUpdateFrame = 0;
       updateSongHistoryRussianTitles();
     });
   });
-
+  
   songHistoryObserver.observe(document.body, {
     childList: true,
     subtree: true,
