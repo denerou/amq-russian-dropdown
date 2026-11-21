@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AMQ Russian Dropdown
-// @version      3.4.0
-// @description
+// @version      4.0
+// @description  
 // @author       denero
 // @match        https://animemusicquiz.com/*
 // @match        https://www.animemusicquiz.com/*
@@ -10,7 +10,6 @@
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
 // @connect      amq.mistnotalone.com
-// @connect      shikimori.io
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -18,9 +17,7 @@
   "use strict";
 
   const API_BASE = "https://amq.mistnotalone.com";
-  const SHIKIMORI_API_HOST = "shikimori.io";
 
-  const SHIKIMORI_SEARCH_CACHE_TTL_MS = 10 * 60 * 1000;
   const SEARCH_DEBOUNCE_MS = 50;
   const AMQ_TITLES_CACHE_TTL_MS = 60 * 1000;
   const MAX_LISTENER_ATTEMPTS = 240;
@@ -28,6 +25,8 @@
   const SEARCH_CACHE_TTL_MS = 5 * 60 * 1000;
   const SEARCH_CACHE_MAX_ENTRIES = 300;
   const MAX_PATTERN_CACHE = 50;
+
+  const MAX_PATTERN_TRANSLITERATION_LENGTH = 40;
 
   const TITLE_TRANSLITERATION_GROUPS = [
     ["си", "ши"], ["ти", "чи"], ["цу", "тсу"], ["дзи", "джи"], ["фу", "ху"],
@@ -40,12 +39,9 @@
 
   const multipleChoiceTitleCache = new Map();
   const nameItemRussianTitleCache = new Map();
-  const shikimoriSearchCache = new Map();
-  const pendingShikimoriSearches = new Map();
-  const confirmedDiscoveredMalIds = new Set();
   const searchResultCache = new Map();
   const compiledPatternCache = new Map();
-  
+
   const annIdToMalIdMap = new Map();
 
   let amqTitlesCache = null;
@@ -54,9 +50,22 @@
   let exactAmqTitleIndexCache = null;
   let amqExactStringIndexCache = null;
 
-  function normalize(value) {
-    return String(value || "")
-      .toLowerCase()
+  function normalize(value, strict = false) {
+    const raw = String(value || "").toLowerCase();
+    if (strict) {
+      return raw
+        .replace(/\b(\d+)(?:st|nd|rd|th)\s+season\b/g, "season $1")
+        .normalize("NFKC")
+        .replace(/[\uFE00-\uFE0F\u{E0100}-\u{E01EF}]/gu, "")
+        .normalize("NFKD")
+        .replace(/\p{S}/gu, character =>
+          ` unicode${character.codePointAt(0).toString(16)} `
+        )
+        .replace(/[^\p{L}\p{N}!*]+/gu, " ")
+        .trim()
+        .replace(/\s+/g, " ");
+    }
+    return raw
       .normalize("NFKD")
       .replace(/[^\p{L}\p{N}]+/gu, " ")
       .trim()
@@ -65,49 +74,44 @@
   }
 
   function normalizeAmqTitle(value) {
-    return String(value || "")
-      .toLowerCase()
-      .replace(/\b(\d+)(?:st|nd|rd|th)\s+season\b/g, "season $1")
-      .normalize("NFKC")
-      .replace(/[\uFE00-\uFE0F\u{E0100}-\u{E01EF}]/gu, "")
-      .normalize("NFKD")
-      .replace(/\p{S}/gu, character =>
-        ` unicode${character.codePointAt(0).toString(16)} `
-      )
-      .replace(/[^\p{L}\p{N}!*]+/gu, " ")
-      .trim()
-      .replace(/\s+/g, " ");
+    return normalize(value, true);
   }
 
   function buildFlexibleTitlePattern(query) {
-    const characters = Array.from(String(query || "").toLowerCase());
+    const raw = String(query || "").toLowerCase();
+    if (!raw.trim()) return "";
+
+    if (raw.length > MAX_PATTERN_TRANSLITERATION_LENGTH) {
+      return escapeRegExp(raw);
+    }
+
+    const characters = Array.from(raw);
     let pattern = "";
-    const isSeparator = (ch) => /[\s\p{P}\p{S}]/u.test(ch);
 
     for (let index = 0; index < characters.length; index++) {
       const character = characters[index];
       const transliteration = getTitleTransliterationMatch(characters, index);
       if (transliteration) {
-        pattern += `(?:${transliteration.alternatives
-          .map(escapeRegExp)
-          .join("|")})`;
+        pattern += `(?:${transliteration.alternatives.map(escapeRegExp).join("|")})`;
         index += transliteration.length - 1;
         continue;
       }
 
-      if (isSeparator(character)) {
+      if (/\s/u.test(character)) {
         let sepCount = 1;
-        while (index + 1 < characters.length && isSeparator(characters[index + 1])) {
+        while (index + 1 < characters.length && /\s/u.test(characters[index + 1])) {
           sepCount++;
           index++;
         }
-        if (sepCount <= 2) {
+        if (sepCount === 1) {
           pattern += "[\\s\\p{P}\\p{S}]+";
         } else {
           pattern += `[\\s\\p{P}\\p{S}]{${sepCount}}`;
         }
+      } else if (/[\p{P}\p{S}]/u.test(character)) {
+        pattern += escapeRegExp(character);
       } else {
-        pattern += character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        pattern += escapeRegExp(character);
       }
     }
 
@@ -189,296 +193,112 @@
     return re.test(title);
   }
 
-  function getCandidateSearchQueries(query) {
-    const words = String(query || "")
-      .toLowerCase()
-      .match(/[\p{L}\p{N}]+/gu) || [];
-    const longestWords = [...new Set(words.filter(word => word.length >= 2))]
-      .sort((left, right) => right.length - left.length)
-      .slice(0, 3);
-    const queries = new Set(getTitleTransliterationVariants(query));
-    for (const word of longestWords) {
-      queries.add(word);
-      for (const variant of getTitleTransliterationVariants(word)) {
-        queries.add(variant);
-      }
-    }
-    return [...queries].filter(candidate => candidate.length >= 2).slice(0, 8);
-  }
-
-  function mergeAnimeResults(responses) {
-    const animes = new Map();
-    for (const response of responses) {
-      if (!Array.isArray(response)) continue;
-      for (const anime of response) {
-        if (!anime?.russian || !anime?.name) continue;
-        const key =
-          `${normalizeAmqTitle(anime.russian)}\u0000${normalizeAmqTitle(anime.name)}`;
-        const current = animes.get(key);
-        if (!current) {
-          animes.set(key, anime);
-        } else {
-          animes.set(key, {
-            ...current,
-            ...anime,
-            titlePriority: Math.max(
-              Number(current.titlePriority) || 0,
-              Number(anime.titlePriority) || 0
-            )
-          });
+  function requestJson(url, options = {}) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: options.method || "GET",
+        url,
+        headers: {
+          Accept: "application/json",
+          ...(options.body ? { "Content-Type": "application/json" } : {})
+        },
+        data: options.body,
+        timeout: 8000,
+        onload(response) {
+          if (response.status < 200 || response.status >= 300) {
+            const errorText = response.responseText ? `: ${response.responseText.substring(0, 50)}` : "";
+            const error = new Error(
+              `${new URL(url).hostname} returned HTTP ${response.status}${errorText}`
+            );
+            error.statusCode = response.status;
+            reject(error);
+            return;
+          }
+          try {
+            resolve(JSON.parse(response.responseText));
+          } catch (error) {
+            reject(error);
+          }
+        },
+        onerror() {
+          reject(new Error(`Could not connect to ${new URL(url).hostname}`));
+        },
+        ontimeout() {
+          reject(new Error(`Request timed out for ${new URL(url).hostname}`));
         }
-      }
-    }
-    return [...animes.values()];
-  }
-
-  function hasUsableSearchMatch(animes, query) {
-    return animes.some(anime => {
-      if (!anime?.russian || !anime?.name) return false;
-      const namesToCheck = [
-        anime.russian,
-        ...(Array.isArray(anime.russianAliases) ? anime.russianAliases : []),
-        ...(Array.isArray(anime.synonyms) ? anime.synonyms : [])
-      ];
-      return namesToCheck.some(name => typeof name === "string" && findTitleMatches(name, query));
+      });
     });
   }
 
-  function getAmqTitleMatchesForAnime(anime) {
-    const exactStringIndex = getAmqExactStringIndex();
-    const exactTitleIndex = getExactAmqTitleIndex();
-    const titleGroups = [
-      {
-        priority: 3,
-        names: [
-          ...(Array.isArray(anime?.romajiTitles) ? anime.romajiTitles : []),
-          anime?.name,
-          ...(Array.isArray(anime?.japanese) ? anime.japanese : [])
-        ]
-      },
-      {
-        priority: 2,
-        names: [
-          ...(Array.isArray(anime?.englishTitles) ? anime.englishTitles : []),
-          ...(Array.isArray(anime?.english) ? anime.english : [])
-        ]
-      },
-      {
-        priority: 1,
-        names: Array.isArray(anime?.synonyms) ? anime.synonyms : []
-      }
-    ];
-    const matches = new Map();
-    for (const group of titleGroups) {
-      for (const name of group.names) {
-        if (typeof name !== "string") continue;
-
-        const exactStringMatch = exactStringIndex?.get(name.toLowerCase());
-        if (exactStringMatch) {
-          const key = normalizeAmqTitle(exactStringMatch.value);
-          const current = matches.get(key);
-          if (!current || group.priority > current.priority || (group.priority === current.priority && exactStringMatch.value.length > current.value.length)) {
-            matches.set(key, { ...exactStringMatch, priority: group.priority });
-          }
-          continue;
-        }
-
-        const exactMatch = exactTitleIndex?.get(normalizeAmqTitle(name));
-        if (exactMatch) {
-          const key = normalizeAmqTitle(exactMatch.value);
-          const current = matches.get(key);
-          if (!current || group.priority > current.priority || (group.priority === current.priority && exactMatch.value.length > current.value.length)) {
-            matches.set(key, { ...exactMatch, priority: group.priority });
-          }
-        }
-      }
-    }
-    const sortedMatches = [...matches.values()].sort(
-      (left, right) =>
-        right.priority - left.priority ||
-        right.value.length - left.value.length
-    );
-    return sortedMatches.length ? [sortedMatches[0]] : [];
-  }
-
-  function getAmqTitleMatchForAnime(anime) {
-    return getAmqTitleMatchesForAnime(anime)[0] || null;
-  }
-
-  function requestShikimoriSearchCandidates(rawQuery) {
-    const query = rawQuery.trim();
-    const cacheKey = query.toLowerCase();
-    const cached = shikimoriSearchCache.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now()) {
-      return Promise.resolve(cached.results);
-    }
-    if (pendingShikimoriSearches.has(cacheKey)) {
-      return pendingShikimoriSearches.get(cacheKey);
-    }
-    const search = (async () => {
-      const searchTerms = getTitleTransliterationVariants(query);
-      const candidates = new Map();
-      let lastError;
-      const collectCandidates = response => {
-        if (!Array.isArray(response)) {
-          throw new Error("Shikimori search response is not an array");
-        }
-        for (const anime of response) {
-          if (!Number.isSafeInteger(anime?.id)) continue;
-          const namesToCheck = [
-            anime.russian,
-            anime.name,
-            ...(Array.isArray(anime.synonyms) ? anime.synonyms : [])
-          ].filter(n => typeof n === "string");
-          if (namesToCheck.some(name => findTitleMatches(name, query))) {
-            candidates.set(anime.id, anime);
-          }
-        }
-      };
-      const requestSearchTerm = async term => {
-        const searchUrl = new URL(`https://${SHIKIMORI_API_HOST}/api/animes`);
-        searchUrl.searchParams.set("search", term);
-        searchUrl.searchParams.set("limit", "50");
-        return requestJsonWithRetry(searchUrl.href, undefined);
-      };
+  async function requestJsonWithRetry(url, options, maxAttempts = 2) {
+    for (let attempt = 1; ; attempt++) {
       try {
-        collectCandidates(await requestSearchTerm(searchTerms[0]));
+        return await requestJson(url, options);
       } catch (error) {
-        lastError = error;
+        const retryable =
+          error.statusCode === 429 ||
+          (error.statusCode >= 500 && error.statusCode <= 599);
+        if (!retryable || attempt >= maxAttempts) throw error;
+        await new Promise(resolve => setTimeout(resolve, 500 * attempt));
       }
-      if (!candidates.size) {
-        for (let index = 1; index < searchTerms.length; index += 4) {
-          if (index > 1) {
-            await new Promise(resolve => setTimeout(resolve, 300));
-          }
-          const responses = await Promise.allSettled(
-            searchTerms
-              .slice(index, index + 4)
-              .map(requestSearchTerm)
-          );
-          for (const response of responses) {
-            if (response.status === "rejected") {
-              lastError = response.reason;
-              continue;
-            }
-            try {
-              collectCandidates(response.value);
-            } catch (error) {
-              lastError = error;
-            }
-          }
-        }
-      }
-      if (!candidates.size && lastError) throw lastError;
-      const results = [];
-      const detailCandidates = [...candidates.values()].slice(0, 6);
-      const detailResponses = await Promise.allSettled(
-        detailCandidates.map(candidate =>
-          requestJsonWithRetry(
-            `https://${SHIKIMORI_API_HOST}/api/animes/${candidate.id}`,
-            undefined
-          )
-        )
-      );
-      for (const response of detailResponses) {
-        if (response.status === "rejected") {
-          lastError = response.reason;
-          continue;
-        }
-        const anime = extractShikimoriAnime(response.value);
-        if (!anime || typeof anime.russian !== "string") {
-          continue;
-        }
-        const detailNamesToCheck = [
-          anime.russian,
-          anime.name,
-          ...(Array.isArray(anime.synonyms) ? anime.synonyms : [])
-        ].filter(n => typeof n === "string");
-        if (!detailNamesToCheck.some(name => findTitleMatches(name, query))) {
-          continue;
-        }
-        const amqTitles = getAmqTitleMatchesForAnime(anime);
-        const malId = Number(anime.myanimelist_id);
-        if (!amqTitles.length || !Number.isSafeInteger(malId) || malId < 1) continue;
-        for (const amqTitle of amqTitles) {
-          results.push({
-            id: malId,
-            malId,
-            name: amqTitle.value,
-            amqTitle: amqTitle.label,
-            russian: anime.russian.trim(),
-            titlePriority: amqTitle.priority
-          });
-        }
-      }
-      if (!results.length && lastError) throw lastError;
-      shikimoriSearchCache.set(cacheKey, {
-        results,
-        expiresAt: Date.now() + SHIKIMORI_SEARCH_CACHE_TTL_MS
-      });
-      return results;
-    })().finally(() => pendingShikimoriSearches.delete(cacheKey));
-    pendingShikimoriSearches.set(cacheKey, search);
-    return search;
+    }
   }
 
-  async function persistDiscoveredShikimoriTitle(candidate, query) {
-    const malId = Number(candidate.malId);
-    const amqTitle =
-      typeof candidate.name === "string" ? candidate.name.trim() : "";
-    const russianTitle =
-      typeof candidate.russian === "string" ? candidate.russian.trim() : "";
-    if (
-      !Number.isSafeInteger(malId) ||
-      malId < 1 ||
-      !russianTitle ||
-      !findTitleMatches(russianTitle, query)
-    ) {
-      return;
-    }
-    if (confirmedDiscoveredMalIds.has(malId)) return;
-    const response = await requestJsonWithRetry(
-      `${API_BASE}/api/discovered-title`,
-      {
-        method: "POST",
-        body: JSON.stringify({ query, malId, amqTitle })
-      }
-    );
-    if (!response?.ok) {
-      throw new Error(`API did not confirm saving MAL ID ${malId}`);
-    }
-    confirmedDiscoveredMalIds.add(malId);
+  function asSingleItem(response) {
+    return Array.isArray(response) ? response[0] : response;
   }
 
-  function persistDiscoveredShikimoriTitles(
-    candidates,
-    query,
-    databaseResults
-  ) {
-    const databaseRussianTitles = new Set(
-      databaseResults.map(anime => normalizeAmqTitle(anime.russian))
-    );
-    const uniqueCandidates = new Map();
-    for (const candidate of candidates) {
-      if (
-        Number.isSafeInteger(candidate?.malId) &&
-        !databaseRussianTitles.has(normalizeAmqTitle(candidate.russian))
-      ) {
-        uniqueCandidates.set(candidate.malId, candidate);
-      }
+  function requestNameItemRussianTitle(annId, malId) {
+    if (!annId && !malId) {
+      return Promise.reject(new Error("No IDs provided"));
     }
-    void (async () => {
-      for (const candidate of uniqueCandidates.values()) {
-        try {
-          await persistDiscoveredShikimoriTitle(candidate, query);
-        } catch (error) {
-          console.debug(
-            "[AMQ Russian Dropdown] Could not persist discovered title",
-            { malId: candidate.malId, error }
-          );
-        }
+
+    const cacheKey = malId ? `mal:${malId}` : `ann:${annId}`;
+    if (nameItemRussianTitleCache.has(cacheKey)) {
+      return nameItemRussianTitleCache.get(cacheKey);
+    }
+
+    const fetchVariant = async (params) => {
+      const url = new URL(`${API_BASE}/api/name-item`);
+      if (params.annId) url.searchParams.set("annId", String(params.annId));
+      if (params.malId) url.searchParams.set("malId", String(params.malId));
+
+      const response = await requestJson(url.href);
+      const data = asSingleItem(response);
+
+      const russianTitle = data?.["Anime Russian"] || data?.animeRussian || data?.russian;
+      const aliases = data?.["Russian Alias"] || data?.russianAliases || [];
+
+      if (russianTitle || (Array.isArray(aliases) && aliases.length > 0)) {
+        return {
+          animeRussian: typeof russianTitle === "string" ? russianTitle.trim() : null,
+          russianAliases: Array.isArray(aliases)
+            ? aliases.map(a => typeof a === "string" ? a.trim() : "").filter(Boolean)
+            : []
+        };
       }
+      return null;
+    };
+
+    const lookup = (async () => {
+      let result = null;
+
+      if (annId && malId) {
+        try { result = await fetchVariant({ annId, malId }); } catch (e) {}
+      }
+      if (!result && malId) {
+        try { result = await fetchVariant({ malId }); } catch (e) {}
+      }
+      if (!result && annId) {
+        try { result = await fetchVariant({ annId }); } catch (e) {}
+      }
+
+      return result || { animeRussian: null, russianAliases: [] };
     })();
+
+    nameItemRussianTitleCache.set(cacheKey, lookup);
+    lookup.catch(() => nameItemRussianTitleCache.delete(cacheKey));
+    return lookup;
   }
 
   function requestCachedSearch(candidate) {
@@ -504,68 +324,40 @@
     });
   }
 
-  function tryShikimoriInBackground(query, databaseResults, onDatabaseResults) {
-    requestShikimoriSearchCandidates(query)
-      .then(shikimoriResults => {
-        if (!shikimoriResults.length) return;
-        onDatabaseResults(
-          mergeAnimeResults([databaseResults, shikimoriResults])
-        );
-        persistDiscoveredShikimoriTitles(
-          shikimoriResults,
-          query,
-          databaseResults
-        );
-      })
-      .catch(error => {
-        console.debug(
-          "[AMQ Russian Dropdown] Background Shikimori search failed",
-          error
-        );
-      });
-  }
-
   async function requestSearchCandidates(rawQuery, onDatabaseResults) {
     const query = rawQuery.trim();
     const requestCandidate = candidate => requestCachedSearch(candidate);
     let databaseResults = [];
-    let shikimoriResults = [];
+
     const publishResults = () => {
-      const results = mergeAnimeResults([databaseResults, shikimoriResults]);
+      const results = mergeAnimeResults([databaseResults]);
       if (results.length) {
         onDatabaseResults(results);
       }
     };
+
     let directResults = [];
-    let directError;
     try {
       directResults = await requestCandidate(query);
     } catch (error) {
-      directError = error;
+      // ignore, will try fallbacks
     }
-    const mergedDirectResults = mergeAnimeResults([directResults]);
-    databaseResults = mergedDirectResults;
+    databaseResults = mergeAnimeResults([directResults]);
     publishResults();
 
-    if (hasUsableSearchMatch(mergedDirectResults, query)) {
-      tryShikimoriInBackground(query, databaseResults, onDatabaseResults);
-      return mergedDirectResults;
+    if (hasUsableSearchMatch(databaseResults, query)) {
+      return databaseResults;
     }
 
     const fallbackQueries = getCandidateSearchQueries(query)
       .filter(candidate => candidate !== query);
 
-    let anyFallbackSuccess = false;
     await Promise.allSettled(
       fallbackQueries.map(candidate =>
         requestCandidate(candidate)
           .then(results => {
             if (Array.isArray(results) && results.length) {
-              anyFallbackSuccess = true;
-              databaseResults = mergeAnimeResults([
-                databaseResults,
-                results
-              ]);
+              databaseResults = mergeAnimeResults([databaseResults, results]);
               publishResults();
             }
           })
@@ -573,31 +365,34 @@
       )
     );
 
-    if (hasUsableSearchMatch(databaseResults, query)) {
-      tryShikimoriInBackground(query, databaseResults, onDatabaseResults);
-      return databaseResults;
-    }
+    return databaseResults;
+  }
 
-    try {
-      shikimoriResults = await requestShikimoriSearchCandidates(query);
-    } catch (error) {
-      if (directError && !anyFallbackSuccess) throw directError;
-      return databaseResults;
+  function requestMultipleChoiceRussianTitle(amqTitle) {
+    if (multipleChoiceTitleCache.has(amqTitle)) {
+      return multipleChoiceTitleCache.get(amqTitle);
     }
-
-    if (
-      directError &&
-      !anyFallbackSuccess &&
-      shikimoriResults.length === 0
-    ) {
-      throw directError;
-    }
-    persistDiscoveredShikimoriTitles(
-      shikimoriResults,
-      query,
-      databaseResults
-    );
-    return mergeAnimeResults([databaseResults, shikimoriResults]);
+    const url = new URL(`${API_BASE}/api/title-translation`);
+    url.searchParams.set("title", amqTitle);
+    const lookup = requestJson(url.href)
+      .then(response => {
+        if (
+          response?.russian !== null &&
+          typeof response?.russian !== "string"
+        ) {
+          throw new Error("Title translation API returned an invalid response");
+        }
+        return response.russian?.trim() || null;
+      })
+      .catch(error => {
+        console.warn(
+          `[AMQ Russian Dropdown] Could not translate multiple-choice title "${amqTitle}".`,
+          error
+        );
+        return null;
+      });
+    multipleChoiceTitleCache.set(amqTitle, lookup);
+    return lookup;
   }
 
   function getAmqTitles() {
@@ -678,112 +473,138 @@
     return amqExactStringIndexCache;
   }
 
-  function requestJson(url, options = {}) {
-    return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        method: options.method || "GET",
-        url,
-        headers: {
-          Accept: "application/json",
-          ...(options.body ? { "Content-Type": "application/json" } : {})
-        },
-        data: options.body,
-        timeout: 8000,
-        onload(response) {
-          if (response.status < 200 || response.status >= 300) {
-            const errorText = response.responseText ? `: ${response.responseText.substring(0, 50)}` : "";
-            const error = new Error(
-              `${new URL(url).hostname} returned HTTP ${response.status}${errorText}`
-            );
-            error.statusCode = response.status;
-            reject(error);
-            return;
-          }
-          try {
-            resolve(JSON.parse(response.responseText));
-          } catch (error) {
-            reject(error);
-          }
-        },
-        onerror() {
-          reject(new Error(`Could not connect to ${new URL(url).hostname}`));
-        },
-        ontimeout() {
-          reject(new Error(`Request timed out for ${new URL(url).hostname}`));
+  function mergeAnimeResults(responses) {
+    const animes = new Map();
+    for (const response of responses) {
+      if (!Array.isArray(response)) continue;
+      for (const anime of response) {
+        if (!anime?.russian || !anime?.name) continue;
+        const key =
+          `${normalizeAmqTitle(anime.russian)}\u0000${normalizeAmqTitle(anime.name)}`;
+        const current = animes.get(key);
+        if (!current) {
+          animes.set(key, anime);
+        } else {
+          animes.set(key, {
+            ...current,
+            ...anime,
+            titlePriority: Math.max(
+              Number(current.titlePriority) || 0,
+              Number(anime.titlePriority) || 0
+            )
+          });
         }
-      });
+      }
+    }
+    return [...animes.values()];
+  }
+
+  function hasUsableSearchMatch(animes, query) {
+    return animes.some(anime => {
+      if (!anime?.russian || !anime?.name) return false;
+      const namesToCheck = [
+        anime.russian,
+        ...(Array.isArray(anime.russianAliases) ? anime.russianAliases : []),
+        ...(Array.isArray(anime.synonyms) ? anime.synonyms : [])
+      ];
+      return namesToCheck.some(name => typeof name === "string" && findTitleMatches(name, query));
     });
   }
 
-  async function requestJsonWithRetry(url, options, maxAttempts = 2) {
-    for (let attempt = 1; ; attempt++) {
-      try {
-        return await requestJson(url, options);
-      } catch (error) {
-        const retryable =
-          error.statusCode === 429 ||
-          (error.statusCode >= 500 && error.statusCode <= 599);
-        if (!retryable || attempt >= maxAttempts) throw error;
-        await new Promise(resolve => setTimeout(resolve, 500 * attempt));
+  function getCandidateSearchQueries(query) {
+    const words = String(query || "")
+      .toLowerCase()
+      .match(/[\p{L}\p{N}]+/gu) || [];
+    const longestWords = [...new Set(words.filter(word => word.length >= 2))]
+      .sort((left, right) => right.length - left.length)
+      .slice(0, 3);
+    const queries = new Set(getTitleTransliterationVariants(query));
+    for (const word of longestWords) {
+      queries.add(word);
+      for (const variant of getTitleTransliterationVariants(word)) {
+        queries.add(variant);
       }
     }
+    return [...queries].filter(candidate => candidate.length >= 2).slice(0, 8);
   }
 
-  function extractShikimoriAnime(response) {
-    return Array.isArray(response) ? response[0] : response;
+  function getAmqTitleMatchesForAnime(anime) {
+    const exactStringIndex = getAmqExactStringIndex();
+    const exactTitleIndex = getExactAmqTitleIndex();
+    const titleGroups = [
+      {
+        priority: 3,
+        names: [
+          ...(Array.isArray(anime?.romajiTitles) ? anime.romajiTitles : []),
+          anime?.name,
+          ...(Array.isArray(anime?.japanese) ? anime.japanese : [])
+        ]
+      },
+      {
+        priority: 2,
+        names: [
+          ...(Array.isArray(anime?.englishTitles) ? anime.englishTitles : []),
+          ...(Array.isArray(anime?.english) ? anime.english : [])
+        ]
+      },
+      {
+        priority: 1,
+        names: Array.isArray(anime?.synonyms) ? anime.synonyms : []
+      }
+    ];
+    const matches = new Map();
+    for (const group of titleGroups) {
+      for (const name of group.names) {
+        if (typeof name !== "string") continue;
+
+        const exactStringMatch = exactStringIndex?.get(name.toLowerCase());
+        if (exactStringMatch) {
+          const key = normalizeAmqTitle(exactStringMatch.value);
+          const current = matches.get(key);
+          if (!current || group.priority > current.priority || (group.priority === current.priority && exactStringMatch.value.length > current.value.length)) {
+            matches.set(key, { ...exactStringMatch, priority: group.priority });
+          }
+          continue;
+        }
+
+        const exactMatch = exactTitleIndex?.get(normalizeAmqTitle(name));
+        if (exactMatch) {
+          const key = normalizeAmqTitle(exactMatch.value);
+          const current = matches.get(key);
+          if (!current || group.priority > current.priority || (group.priority === current.priority && exactMatch.value.length > current.value.length)) {
+            matches.set(key, { ...exactMatch, priority: group.priority });
+          }
+        }
+      }
+    }
+    const sortedMatches = [...matches.values()].sort(
+      (left, right) =>
+        right.priority - left.priority ||
+        right.value.length - left.value.length
+    );
+    return sortedMatches.length ? [sortedMatches[0]] : [];
   }
 
-  function requestNameItemRussianTitle(annId, malId) {
-    if (!annId && !malId) {
-      return Promise.reject(new Error("No IDs provided"));
+  function getAmqTitleMatchForAnime(anime) {
+    return getAmqTitleMatchesForAnime(anime)[0] || null;
+  }
+
+  function getSearchResultRelevance(title, normalizedQuery) {
+    const normalizedTitle = normalize(title);
+    let score = 0;
+
+    if (normalizedTitle === normalizedQuery) score += 2000;
+    else if (normalizedTitle.startsWith(normalizedQuery)) score += 1000;
+    else if (normalizedTitle.includes(` ${normalizedQuery}`)) score += 500;
+
+    if (/\b\d+\b/.test(normalizedTitle) && !/\b\d+\b/.test(normalizedQuery)) {
+      score -= 500;
     }
-    
-    const cacheKey = malId ? `mal:${malId}` : `ann:${annId}`;
-    if (nameItemRussianTitleCache.has(cacheKey)) {
-      return nameItemRussianTitleCache.get(cacheKey);
+
+    if (/\b(?:ova|oav|special|recap|movie|film)\b/i.test(title)) {
+      score -= 1000;
     }
-
-    const fetchVariant = async (params) => {
-      const url = new URL(`${API_BASE}/api/name-item`);
-      if (params.annId) url.searchParams.set("annId", String(params.annId));
-      if (params.malId) url.searchParams.set("malId", String(params.malId));
-      
-      const response = await requestJson(url.href);
-      const data = Array.isArray(response) ? response[0] : response;
-      
-      const russianTitle = data?.["Anime Russian"] || data?.animeRussian || data?.russian;
-      const aliases = data?.["Russian Alias"] || data?.russianAliases || [];
-      
-      if (russianTitle || (Array.isArray(aliases) && aliases.length > 0)) {
-        return {
-          animeRussian: typeof russianTitle === "string" ? russianTitle.trim() : null,
-          russianAliases: Array.isArray(aliases) 
-            ? aliases.map(a => typeof a === "string" ? a.trim() : "").filter(Boolean)
-            : []
-        };
-      }
-      return null;
-    };
-
-    const lookup = (async () => {
-      let result = null;
-      
-      if (annId && malId) {
-        try { result = await fetchVariant({ annId, malId }); } catch (e) {}
-      }
-      if (!result && malId) {
-        try { result = await fetchVariant({ malId }); } catch (e) {}
-      }
-      if (!result && annId) {
-        try { result = await fetchVariant({ annId }); } catch (e) {}
-      }
-
-      return result || { animeRussian: null, russianAliases: [] };
-    })();
-
-    nameItemRussianTitleCache.set(cacheKey, lookup);
-    lookup.catch(() => nameItemRussianTitleCache.delete(cacheKey));
-    return lookup;
+    return score - normalizedTitle.length;
   }
 
   const COLORS = {
@@ -821,22 +642,418 @@
 
   panel.append(viewport, scrollbarTrack);
 
-  let activeAnswerTitleRequest = 0;
-  let answerRussianTitleListenerBound = false;
-
   let debounceTimer;
   let requestId = 0;
   let keyboardIndex = -1;
   let mouseIndex = -1;
   let currentResults = [];
+  let lastKnownResults = [];
+  let pendingManualSelection = null;
   let dragStartY = 0;
   let dragStartScrollTop = 0;
   let answerRound = 0;
-  let selectionGeneration = 0;
   let lastQuery = "";
   let lastRawQuery = "";
   let lastRenderedRequestId = -1;
   let lastRenderedQuery = "";
+
+  function getInput() {
+    return document.querySelector("#qpAnswerInput");
+  }
+
+  function updateColors(input) {
+    const nativeList = document.querySelector(
+      "#qpAnswerInputContainer .awesomplete ul"
+    );
+    const selectedOption = nativeList?.querySelector(
+      "li[aria-selected='true'], li:hover"
+    );
+    const variableElements = [];
+    for (let element = input; element; element = element.parentElement) {
+      variableElements.push(element);
+    }
+    if (document.body) variableElements.push(document.body);
+    if (document.documentElement) variableElements.push(document.documentElement);
+    function findColor(candidates) {
+      for (const [element, property] of candidates) {
+        if (!element) continue;
+        const color = getComputedStyle(element)[property].trim();
+        if (color && color !== "transparent" && color !== "rgba(0, 0, 0, 0)") {
+          return color;
+        }
+      }
+      return "";
+    }
+    for (const [key, variable] of Object.entries(COLORS.variables)) {
+      let value = "";
+      for (const element of variableElements) {
+        value = getComputedStyle(element).getPropertyValue(variable).trim();
+        if (value) break;
+      }
+      const candidates =
+        key === "textColor"
+          ? [[input, "color"], [nativeList, "color"], [selectedOption, "color"]]
+          : key === "panelBackground"
+            ? [[nativeList, "backgroundColor"], [input, "backgroundColor"]]
+            : [
+                [selectedOption, "backgroundColor"],
+                [document.querySelector(".btn-primary"), "backgroundColor"],
+                [input, "borderColor"]
+              ].filter(([element]) => element);
+      COLORS.current[key] =
+        value || findColor(candidates) || COLORS.fallback[key];
+    }
+    panel.style.setProperty(
+      "--amq-russian-accent",
+      COLORS.current.accentColor
+    );
+  }
+
+  function positionPanel() {
+    const input = getInput();
+    const wrapper = document.querySelector(
+      "#qpAnswerInputContainer .awesomplete"
+    );
+    if (!input || !wrapper) return;
+    updateColors(input);
+    if (getComputedStyle(wrapper).position === "static") {
+      wrapper.classList.add("amqRussianPositioned");
+    }
+    if (panel.parentElement !== wrapper) {
+      wrapper.appendChild(panel);
+    }
+    panel.style.left = "0";
+    panel.style.top = `${input.offsetHeight}px`;
+    panel.style.width = `${wrapper.getBoundingClientRect().width}px`;
+    panel.style.font = getComputedStyle(input).font;
+    panel.style.backgroundColor = COLORS.current.panelBackground;
+    panel.style.color = COLORS.current.textColor;
+    updateScrollbar();
+  }
+
+  function updateScrollbar() {
+    const visibleHeight = viewport.clientHeight;
+    const contentHeight = viewport.scrollHeight;
+    const trackHeight = scrollbarTrack.clientHeight;
+    if (!visibleHeight || !trackHeight || contentHeight <= visibleHeight) {
+      scrollbarThumb.style.display = "none";
+      return;
+    }
+    scrollbarThumb.style.display = "block";
+    const thumbHeight = Math.max(
+      20,
+      trackHeight * (visibleHeight / contentHeight) * 0.25
+    );
+    const maxThumbTop = trackHeight - thumbHeight;
+    const maxScrollTop = contentHeight - visibleHeight;
+    const thumbTop =
+      maxScrollTop > 0
+        ? (viewport.scrollTop / maxScrollTop) * maxThumbTop
+        : 0;
+    scrollbarThumb.style.height = `${thumbHeight}px`;
+    scrollbarThumb.style.top = `${thumbTop}px`;
+  }
+
+  function hidePanel() {
+    panel.style.display = "none";
+    keyboardIndex = -1;
+    mouseIndex = -1;
+    currentResults = [];
+    lastQuery = "";
+    lastRawQuery = "";
+    lastRenderedRequestId = -1;
+    lastRenderedQuery = "";
+    pendingManualSelection = null;
+    requestId++;
+  }
+
+  function showNotice(message) {
+    currentResults = [];
+    viewport.replaceChildren();
+    const row = document.createElement("div");
+    row.className = "amqRussianNoticeRow";
+    row.textContent = message;
+    viewport.appendChild(row);
+    positionPanel();
+    panel.style.display = "block";
+    updateScrollbar();
+  }
+
+  function appendHighlightedText(container, text, query) {
+    const source = String(text || "");
+    const matcher = new RegExp(buildFlexibleTitlePattern(query), "giu");
+    let previousIndex = 0;
+    let matchResult;
+    if (!matcher.test(source)) {
+      container.textContent = source;
+      return;
+    }
+    matcher.lastIndex = 0;
+    while ((matchResult = matcher.exec(source))) {
+      if (matchResult.index > previousIndex) {
+        container.append(
+          document.createTextNode(source.slice(previousIndex, matchResult.index))
+        );
+      }
+      const match = document.createElement("span");
+      match.className = "amqRussianMatch";
+      match.textContent = matchResult[0];
+      container.append(match);
+      previousIndex = matcher.lastIndex;
+      if (matchResult[0].length === 0) matcher.lastIndex++;
+    }
+    if (previousIndex < source.length) {
+      container.append(document.createTextNode(source.slice(previousIndex)));
+    }
+  }
+
+  function styleButton(button, state) {
+    const matches = button.querySelectorAll(".amqRussianMatch");
+    let foreground;
+    if (state === "mouse") {
+      button.style.backgroundColor = COLORS.current.accentColor;
+      foreground = COLORS.current.panelBackground;
+      button.style.color = foreground;
+    } else if (state === "keyboard") {
+      button.style.backgroundColor =
+        `color-mix(in srgb, ${COLORS.current.accentColor} 80%, black)`;
+      foreground = COLORS.current.textColor;
+      button.style.color = foreground;
+    } else {
+      button.style.backgroundColor = COLORS.current.panelBackground;
+      foreground = COLORS.current.textColor;
+      button.style.color = foreground;
+    }
+    matches.forEach(match => {
+      match.style.color =
+        state ? foreground : COLORS.current.accentColor;
+    });
+  }
+
+  function refreshButtonStates() {
+    const buttons = [...viewport.querySelectorAll("button[data-result-index]")];
+    buttons.forEach((button, index) => {
+      let state = "";
+      if (index === mouseIndex) {
+        state = "mouse";
+      } else if (index === keyboardIndex) {
+        state = "keyboard";
+      }
+      styleButton(button, state);
+      button.setAttribute(
+        "aria-selected",
+        String(index === keyboardIndex || index === mouseIndex)
+      );
+    });
+  }
+
+  function setKeyboardIndex(index) {
+    const buttons = [...viewport.querySelectorAll("button[data-result-index]")];
+    if (!buttons.length) return;
+    keyboardIndex = (index + buttons.length) % buttons.length;
+    refreshButtonStates();
+    const selected = buttons[keyboardIndex];
+    const rowTop = selected.offsetTop;
+    const rowBottom = rowTop + selected.offsetHeight;
+    const visibleTop = viewport.scrollTop;
+    const visibleBottom = visibleTop + viewport.clientHeight;
+    if (rowTop < visibleTop) {
+      viewport.scrollTop = rowTop;
+    } else if (rowBottom > visibleBottom) {
+      viewport.scrollTop = rowBottom - viewport.clientHeight;
+    }
+  }
+
+  function showResults(results, query) {
+    lastKnownResults = results;
+
+    const isSameResults = results.length === currentResults.length && results.every((r, i) => r.amqValue === currentResults[i].amqValue && r.russian === currentResults[i].russian);
+    if (isSameResults && lastRenderedQuery === query && panel.style.display !== "none") {
+      return;
+    }
+
+    const selectedAmqTitle =
+      keyboardIndex >= 0
+        ? `${normalizeAmqTitle(currentResults[keyboardIndex]?.amqValue)}\u0000${normalizeAmqTitle(currentResults[keyboardIndex]?.russian)}`
+        : "";
+    currentResults = results;
+    keyboardIndex = selectedAmqTitle
+      ? results.findIndex(
+          result => `${normalizeAmqTitle(result.amqValue)}\u0000${normalizeAmqTitle(result.russian)}` === selectedAmqTitle
+        )
+      : -1;
+    mouseIndex = -1;
+    viewport.replaceChildren();
+    if (!results.length) {
+      panel.style.display = "none";
+      return;
+    }
+    results.forEach((result, index) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "amqRussianResultButton";
+      button.dataset.resultIndex = String(index);
+      button.setAttribute("aria-selected", "false");
+      const russianTitle = document.createElement("span");
+      appendHighlightedText(russianTitle, result.russian, query);
+      const separator = document.createElement("span");
+      separator.className = "amqRussianResultSeparator";
+      separator.textContent = " / ";
+      const amqTitle = document.createElement("span");
+      amqTitle.className = "amqRussianResultAmqTitle";
+      amqTitle.textContent = result.amqValue;
+      button.append(russianTitle, separator, amqTitle);
+      button.addEventListener("pointerenter", () => {
+        mouseIndex = index;
+        refreshButtonStates();
+      });
+      button.addEventListener("pointerleave", () => {
+        if (mouseIndex === index) {
+          mouseIndex = -1;
+          refreshButtonStates();
+        }
+      });
+      button.addEventListener("pointerdown", event => {
+        event.preventDefault();
+      });
+      button.addEventListener("click", event => {
+        event.preventDefault();
+        event.stopPropagation();
+        fillInputWithResult(result);
+      });
+      viewport.appendChild(button);
+    });
+    positionPanel();
+    panel.style.display = "block";
+    updateScrollbar();
+    refreshButtonStates();
+    lastRenderedQuery = query;
+  }
+
+  function renderSearchResults(animes, rawQuery, currentRequest, titleIndex) {
+    if (!Array.isArray(animes)) return;
+    if (currentRequest !== requestId) return;
+    if (currentRequest < lastRenderedRequestId) return;
+
+    const targetQuery = rawQuery;
+    const normalizedQuery = normalize(targetQuery);
+    const isTrailingSpace = targetQuery.endsWith(" ");
+
+    const matchedResults = [];
+    for (const anime of animes) {
+      if (!anime?.russian || !anime?.name) continue;
+
+      const namesToCheck = [
+        anime.russian,
+        ...(Array.isArray(anime.russianAliases) ? anime.russianAliases : []),
+        ...(Array.isArray(anime.synonyms) ? anime.synonyms : [])
+      ];
+
+      const matchedName = namesToCheck.find(name => typeof name === "string" && findTitleMatches(name, targetQuery));
+      if (!matchedName) continue;
+
+      const exactStringMatch = typeof anime.name === 'string' ? getAmqExactStringIndex()?.get(anime.name.toLowerCase()) : null;
+      const match =
+        getAmqTitleMatchForAnime(anime) ||
+        exactStringMatch ||
+        getExactAmqTitleIndex()?.get(normalizeAmqTitle(anime.name)) ||
+        titleIndex.get(normalize(anime.name)) ||
+        { value: anime.name, label: anime.name };
+
+      matchedResults.push({
+        id: anime.id,
+        malId: Number(anime.malId) || null,
+        russian: matchedName,
+        amqTitle: anime.preferredTitle || anime.name || match.label,
+        amqValue: match.value,
+        titlePriority: Number(anime.titlePriority) || 0,
+        relevance: getSearchResultRelevance(matchedName, normalizedQuery)
+      });
+    }
+
+    let shouldUngroup = false;
+    if (isTrailingSpace && matchedResults.length > 0) {
+      const uniqueAmqValues = new Set(matchedResults.map(r => normalizeAmqTitle(r.amqValue)));
+      if (uniqueAmqValues.size === 1) {
+        shouldUngroup = true;
+      }
+    }
+
+    const bestResultByAmqTitle = new Map();
+    for (const result of matchedResults) {
+      const key = shouldUngroup
+        ? `${normalizeAmqTitle(result.amqValue)}\u0000${normalizeAmqTitle(result.russian)}`
+        : normalizeAmqTitle(result.amqValue);
+
+      const current = bestResultByAmqTitle.get(key);
+      if (
+        !current ||
+        result.titlePriority > current.titlePriority ||
+        (
+          result.titlePriority === current.titlePriority &&
+          result.relevance > current.relevance
+        )
+      ) {
+        bestResultByAmqTitle.set(key, result);
+      }
+    }
+
+    const results = [...bestResultByAmqTitle.values()];
+    results.sort(
+      (a, b) =>
+        b.titlePriority - a.titlePriority ||
+        b.relevance - a.relevance ||
+        a.russian.localeCompare(b.russian, "ru")
+    );
+    if (results.length) {
+      showResults(results, targetQuery);
+      lastRenderedRequestId = currentRequest;
+    } else if (!currentResults.length) {
+      panel.style.display = "none";
+    }
+  }
+
+  function search(rawQuery, currentRequest) {
+    const titleIndex = getAmqTitleIndex();
+    if (!titleIndex?.size) {
+      showNotice("Список названий AMQ пока недоступен.");
+      return;
+    }
+    const accumulatedResults = new Map();
+    const addResults = animes => {
+      if (!Array.isArray(animes) || !animes.length) return;
+      for (const anime of animes) {
+        if (!anime?.russian || !anime?.name) continue;
+        const key = anime.malId
+          ? `mal:${anime.malId}`
+          : `${normalizeAmqTitle(anime.russian)}\u0000${normalizeAmqTitle(anime.name)}`;
+        const current = accumulatedResults.get(key);
+        if (!current || (!current.preferredTitle && anime.preferredTitle)) {
+          accumulatedResults.set(key, anime);
+        }
+      }
+      renderSearchResults(
+        [...accumulatedResults.values()],
+        rawQuery,
+        currentRequest,
+        titleIndex
+      );
+    };
+    requestSearchCandidates(rawQuery, databaseResults => {
+      addResults(databaseResults);
+    }).catch(error => {
+      if (
+        currentRequest === requestId &&
+        accumulatedResults.size === 0 &&
+        currentResults.length === 0
+      ) {
+        showNotice(`Ошибка поиска: ${error.message}`);
+      }
+    });
+  }
+
+  let activeAnswerTitleRequest = 0;
+  let answerRussianTitleListenerBound = false;
 
   function setAnswerRussianTitle(tooltip, animeRussian, aliases = []) {
     const content = tooltip.querySelector(".amqAnswerRussianTitleText");
@@ -959,16 +1176,17 @@
   function handleAnswerResults(data) {
     answerRound++;
     hidePanel();
-    
+    lastKnownResults = [];
+
     const rawAnnId = data?.songInfo?.siteIds?.annId;
     const rawMalId = data?.songInfo?.siteIds?.malId;
     const annId = (Number.isSafeInteger(rawAnnId) && rawAnnId > 0) ? rawAnnId : null;
     const malId = (Number.isSafeInteger(rawMalId) && rawMalId > 0) ? rawMalId : null;
-    
+
     const animeNames = data?.songInfo?.animeNames || {};
     const romaji = animeNames.romaji || "";
     const english = animeNames.english || "";
-    
+
     if (annId && malId) {
       annIdToMalIdMap.set(annId, malId);
     }
@@ -976,9 +1194,9 @@
     const currentRequest = ++activeAnswerTitleRequest;
     const container = document.querySelector("#qpAnimeNameContainer");
     if (!container || (!malId && !annId)) return;
-    
+
     const tooltip = ensureAnswerRussianTitleTooltip(container);
-    
+
     const content = tooltip.querySelector(".amqAnswerRussianTitleText");
     if (content) content.textContent = "";
     tooltip.style.display = "none";
@@ -988,23 +1206,20 @@
         if (currentRequest !== activeAnswerTitleRequest || !container.isConnected) {
           return;
         }
-        
+
         if (result.animeRussian || result.russianAliases.length > 0) {
-            // Если нашли в базе
             setAnswerRussianTitle(tooltip, result.animeRussian, result.russianAliases);
         } else {
-            // Если не нашли — запускаем авто-добавление
             autoAddAnimeToDatabase(malId, annId, romaji, english, tooltip, container, currentRequest);
-            return; 
+            return;
         }
-        
+
         if (container.matches(":hover")) {
           showAnswerRussianTitleTooltip(container, tooltip);
         }
       })
       .catch(error => {
         if (currentRequest !== activeAnswerTitleRequest) return;
-        // При ошибке тоже пробуем авто-добавить
         autoAddAnimeToDatabase(malId, annId, romaji, english, tooltip, container, currentRequest);
       });
   }
@@ -1195,33 +1410,6 @@
     ).trim();
   }
 
-  function requestMultipleChoiceRussianTitle(amqTitle) {
-    if (multipleChoiceTitleCache.has(amqTitle)) {
-      return multipleChoiceTitleCache.get(amqTitle);
-    }
-    const url = new URL(`${API_BASE}/api/title-translation`);
-    url.searchParams.set("title", amqTitle);
-    const lookup = requestJson(url.href)
-      .then(response => {
-        if (
-          response?.russian !== null &&
-          typeof response?.russian !== "string"
-        ) {
-          throw new Error("Title translation API returned an invalid response");
-        }
-        return response.russian?.trim() || null;
-      })
-      .catch(error => {
-        console.warn(
-          `[AMQ Russian Dropdown] Could not translate multiple-choice title "${amqTitle}".`,
-          error
-        );
-        return null;
-      });
-    multipleChoiceTitleCache.set(amqTitle, lookup);
-    return lookup;
-  }
-
   function translateMultipleChoiceTitles(root) {
     for (const entry of root.querySelectorAll(".qpMultipleChoiceEntryContainer")) {
       const textElement = entry.querySelector(".qpMultipleChoiceEntryText");
@@ -1268,212 +1456,6 @@
     return true;
   }
 
-  function getInput() {
-    return document.querySelector("#qpAnswerInput");
-  }
-
-  function updateColors(input) {
-    const nativeList = document.querySelector(
-      "#qpAnswerInputContainer .awesomplete ul"
-    );
-    const selectedOption = nativeList?.querySelector(
-      "li[aria-selected='true'], li:hover"
-    );
-    const variableElements = [];
-    for (let element = input; element; element = element.parentElement) {
-      variableElements.push(element);
-    }
-    if (document.body) variableElements.push(document.body);
-    if (document.documentElement) variableElements.push(document.documentElement);
-    function findColor(candidates) {
-      for (const [element, property] of candidates) {
-        if (!element) continue;
-        const color = getComputedStyle(element)[property].trim();
-        if (color && color !== "transparent" && color !== "rgba(0, 0, 0, 0)") {
-          return color;
-        }
-      }
-      return "";
-    }
-    for (const [key, variable] of Object.entries(COLORS.variables)) {
-      let value = "";
-      for (const element of variableElements) {
-        value = getComputedStyle(element).getPropertyValue(variable).trim();
-        if (value) break;
-      }
-      const candidates =
-        key === "textColor"
-          ? [[input, "color"], [nativeList, "color"], [selectedOption, "color"]]
-          : key === "panelBackground"
-            ? [[nativeList, "backgroundColor"], [input, "backgroundColor"]]
-            : [
-                [selectedOption, "backgroundColor"],
-                [document.querySelector(".btn-primary"), "backgroundColor"],
-                [input, "borderColor"]
-              ].filter(([element]) => element);
-      COLORS.current[key] =
-        value || findColor(candidates) || COLORS.fallback[key];
-    }
-    panel.style.setProperty(
-      "--amq-russian-accent",
-      COLORS.current.accentColor
-    );
-  }
-
-  function positionPanel() {
-    const input = getInput();
-    const wrapper = document.querySelector(
-      "#qpAnswerInputContainer .awesomplete"
-    );
-    if (!input || !wrapper) return;
-    updateColors(input);
-    if (getComputedStyle(wrapper).position === "static") {
-      wrapper.classList.add("amqRussianPositioned");
-    }
-    if (panel.parentElement !== wrapper) {
-      wrapper.appendChild(panel);
-    }
-    panel.style.left = "0";
-    panel.style.top = `${input.offsetHeight}px`;
-    panel.style.width = `${wrapper.getBoundingClientRect().width}px`;
-    panel.style.font = getComputedStyle(input).font;
-    panel.style.backgroundColor = COLORS.current.panelBackground;
-    panel.style.color = COLORS.current.textColor;
-    updateScrollbar();
-  }
-
-  function updateScrollbar() {
-    const visibleHeight = viewport.clientHeight;
-    const contentHeight = viewport.scrollHeight;
-    const trackHeight = scrollbarTrack.clientHeight;
-    if (!visibleHeight || !trackHeight || contentHeight <= visibleHeight) {
-      scrollbarThumb.style.display = "none";
-      return;
-    }
-    scrollbarThumb.style.display = "block";
-    const thumbHeight = Math.max(
-      20,
-      trackHeight * (visibleHeight / contentHeight) * 0.25
-    );
-    const maxThumbTop = trackHeight - thumbHeight;
-    const maxScrollTop = contentHeight - visibleHeight;
-    const thumbTop =
-      maxScrollTop > 0
-        ? (viewport.scrollTop / maxScrollTop) * maxThumbTop
-        : 0;
-    scrollbarThumb.style.height = `${thumbHeight}px`;
-    scrollbarThumb.style.top = `${thumbTop}px`;
-  }
-
-  function hidePanel() {
-    panel.style.display = "none";
-    keyboardIndex = -1;
-    mouseIndex = -1;
-    currentResults = [];
-    lastQuery = "";
-    lastRawQuery = "";
-    lastRenderedRequestId = -1;
-    lastRenderedQuery = "";
-    requestId++;
-  }
-
-  function showNotice(message) {
-    currentResults = [];
-    viewport.replaceChildren();
-    const row = document.createElement("div");
-    row.className = "amqRussianNoticeRow";
-    row.textContent = message;
-    viewport.appendChild(row);
-    positionPanel();
-    panel.style.display = "block";
-    updateScrollbar();
-  }
-
-  function appendHighlightedText(container, text, query) {
-    const source = String(text || "");
-    const matcher = new RegExp(buildFlexibleTitlePattern(query), "giu");
-    let previousIndex = 0;
-    let matchResult;
-    if (!matcher.test(source)) {
-      container.textContent = source;
-      return;
-    }
-    matcher.lastIndex = 0;
-    while ((matchResult = matcher.exec(source))) {
-      if (matchResult.index > previousIndex) {
-        container.append(
-          document.createTextNode(source.slice(previousIndex, matchResult.index))
-        );
-      }
-      const match = document.createElement("span");
-      match.className = "amqRussianMatch";
-      match.textContent = matchResult[0];
-      container.append(match);
-      previousIndex = matcher.lastIndex;
-      if (matchResult[0].length === 0) matcher.lastIndex++;
-    }
-    if (previousIndex < source.length) {
-      container.append(document.createTextNode(source.slice(previousIndex)));
-    }
-  }
-
-  function styleButton(button, state) {
-    const matches = button.querySelectorAll(".amqRussianMatch");
-    let foreground;
-    if (state === "mouse") {
-      button.style.backgroundColor = COLORS.current.accentColor;
-      foreground = COLORS.current.panelBackground;
-      button.style.color = foreground;
-    } else if (state === "keyboard") {
-      button.style.backgroundColor =
-        `color-mix(in srgb, ${COLORS.current.accentColor} 80%, black)`;
-      foreground = COLORS.current.textColor;
-      button.style.color = foreground;
-    } else {
-      button.style.backgroundColor = COLORS.current.panelBackground;
-      foreground = COLORS.current.textColor;
-      button.style.color = foreground;
-    }
-    matches.forEach(match => {
-      match.style.color =
-        state ? foreground : COLORS.current.accentColor;
-    });
-  }
-
-  function refreshButtonStates() {
-    const buttons = [...viewport.querySelectorAll("button[data-result-index]")];
-    buttons.forEach((button, index) => {
-      let state = "";
-      if (index === mouseIndex) {
-        state = "mouse";
-      } else if (index === keyboardIndex) {
-        state = "keyboard";
-      }
-      styleButton(button, state);
-      button.setAttribute(
-        "aria-selected",
-        String(index === keyboardIndex || index === mouseIndex)
-      );
-    });
-  }
-
-  function setKeyboardIndex(index) {
-    const buttons = [...viewport.querySelectorAll("button[data-result-index]")];
-    if (!buttons.length) return;
-    keyboardIndex = (index + buttons.length) % buttons.length;
-    refreshButtonStates();
-    const selected = buttons[keyboardIndex];
-    const rowTop = selected.offsetTop;
-    const rowBottom = rowTop + selected.offsetHeight;
-    const visibleTop = viewport.scrollTop;
-    const visibleBottom = visibleTop + viewport.clientHeight;
-    if (rowTop < visibleTop) {
-      viewport.scrollTop = rowTop;
-    } else if (rowBottom > visibleBottom) {
-      viewport.scrollTop = rowBottom - viewport.clientHeight;
-    }
-  }
-
   function submitSelectedTitleAndSkip(result) {
     const input = getInput();
     const answerInput = unsafeWindow.quiz?.answerInput;
@@ -1484,16 +1466,11 @@
       return;
     }
     hidePanel();
-    const selectionId = ++selectionGeneration;
     const selectionRound = answerRound;
     input.value = result.amqValue;
     input.focus();
     setTimeout(() => {
-      if (
-        selectionId !== selectionGeneration ||
-        selectionRound !== answerRound ||
-        input.value !== result.amqValue
-      ) {
+      if (selectionRound !== answerRound || input.value !== result.amqValue) {
         return;
       }
       try {
@@ -1507,196 +1484,89 @@
     }, 0);
   }
 
-  function showResults(results, query) {
-    const isSameResults = results.length === currentResults.length && results.every((r, i) => r.amqValue === currentResults[i].amqValue);
-    if (isSameResults && lastRenderedQuery === query && panel.style.display !== "none") {
-      return;
-    }
-
-    const selectedAmqTitle =
-      keyboardIndex >= 0
-        ? normalizeAmqTitle(currentResults[keyboardIndex]?.amqValue)
-        : "";
-    currentResults = results;
-    keyboardIndex = selectedAmqTitle
-      ? results.findIndex(
-          result => normalizeAmqTitle(result.amqValue) === selectedAmqTitle
-        )
-      : -1;
-    mouseIndex = -1;
-    viewport.replaceChildren();
-    if (!results.length) {
-      panel.style.display = "none";
-      return;
-    }
-    results.forEach((result, index) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "amqRussianResultButton";
-      button.dataset.resultIndex = String(index);
-      button.setAttribute("aria-selected", "false");
-      const russianTitle = document.createElement("span");
-      appendHighlightedText(russianTitle, result.russian, query);
-      const separator = document.createElement("span");
-      separator.className = "amqRussianResultSeparator";
-      separator.textContent = " / ";
-      const amqTitle = document.createElement("span");
-      amqTitle.className = "amqRussianResultAmqTitle";
-      amqTitle.textContent = result.amqTitle;
-      button.append(russianTitle, separator, amqTitle);
-      button.addEventListener("pointerenter", () => {
-        mouseIndex = index;
-        refreshButtonStates();
-      });
-      button.addEventListener("pointerleave", () => {
-        if (mouseIndex === index) {
-          mouseIndex = -1;
-          refreshButtonStates();
-        }
-      });
-      button.addEventListener("pointerdown", event => {
-        event.preventDefault();
-      });
-      button.addEventListener("click", () => {
-        submitSelectedTitleAndSkip(result);
-      });
-      viewport.appendChild(button);
-    });
-    positionPanel();
-    panel.style.display = "block";
-    updateScrollbar();
-    refreshButtonStates();
-    lastRenderedQuery = query;
+  function fillInputWithResult(result) {
+    const input = getInput();
+    if (!input || !result?.amqValue) return;
+    hidePanel();
+    input.value = result.amqValue;
+    input.focus();
+    pendingManualSelection = result;
   }
 
-  function renderSearchResults(animes, rawQuery, currentRequest, titleIndex) {
-    if (!Array.isArray(animes)) return;
+  function getQuizTimerElement() {
+    const directSelectors = [
+      "#qpTimer", ".qpTimer", ".qpTimerText", "#qpTimerText",
+      "#quizTimer", ".quizTimer", "#timerBarNumber", ".timerBarNumber",
+      "#qpInfoTimer", ".qpInfoTimer"
+    ];
+    const isTimerText = text => /^\d+(?:[.,:]\d+)*$/.test(text);
 
-    const isCurrent = currentRequest === requestId;
-    const isStaleRelevant =
-      !isCurrent &&
-      rawQuery.length > 0 &&
-      lastRawQuery.length > rawQuery.length &&
-      lastRawQuery.startsWith(rawQuery);
-    if (!isCurrent && !isStaleRelevant) return;
-
-    if (currentRequest < lastRenderedRequestId) return;
-
-    const targetQuery = isCurrent ? rawQuery : lastRawQuery;
-
-    const bestResultByAmqTitle = new Map();
-    const normalizedQuery = normalize(targetQuery);
-    for (const anime of animes) {
-      if (!anime?.russian || !anime?.name) continue;
-
-      const namesToCheck = [
-        anime.russian,
-        ...(Array.isArray(anime.russianAliases) ? anime.russianAliases : []),
-        ...(Array.isArray(anime.synonyms) ? anime.synonyms : [])
-      ];
-      
-      const matchedName = namesToCheck.find(name => typeof name === "string" && findTitleMatches(name, targetQuery));
-      if (!matchedName) continue;
-
-      const exactStringMatch = typeof anime.name === 'string' ? getAmqExactStringIndex()?.get(anime.name.toLowerCase()) : null;
-      const match =
-        getAmqTitleMatchForAnime(anime) ||
-        exactStringMatch ||
-        getExactAmqTitleIndex()?.get(normalizeAmqTitle(anime.name)) ||
-        titleIndex.get(normalize(anime.name)) ||
-        { value: anime.name, label: anime.name };
-
-      const result = {
-        id: anime.id,
-        malId: Number(anime.malId) || null,
-        russian: matchedName,
-        amqTitle: anime.preferredTitle || anime.name || match.label,
-        amqValue: match.value,
-        titlePriority: Number(anime.titlePriority) || 0,
-        relevance: getSearchResultRelevance(matchedName, normalizedQuery)
-      };
-      const key = normalizeAmqTitle(match.value);
-      const current = bestResultByAmqTitle.get(key);
-      if (
-        !current ||
-        result.titlePriority > current.titlePriority ||
-        (
-          result.titlePriority === current.titlePriority &&
-          result.relevance > current.relevance
-        )
-      ) {
-        bestResultByAmqTitle.set(key, result);
+    for (const selector of directSelectors) {
+      const el = document.querySelector(selector);
+      if (el && isTimerText((el.textContent || "").trim().replace(",", "."))) {
+        return el;
       }
     }
-    const results = [...bestResultByAmqTitle.values()];
-    results.sort(
-      (a, b) =>
-        b.titlePriority - a.titlePriority ||
-        b.relevance - a.relevance ||
-        a.russian.localeCompare(b.russian, "ru")
+    const fallback = document.querySelectorAll(
+      "#qpInfoText, .qpInfoText, #qpInfoLevel, .qpInfoLevel, #qpHiderText, .qpHiderText"
     );
-    if (results.length) {
-      showResults(results, targetQuery);
-      lastRenderedRequestId = currentRequest;
-    } else if (!currentResults.length) {
-      panel.style.display = "none";
+    for (const el of fallback) {
+      if (isTimerText((el.textContent || "").trim().replace(",", "."))) {
+        return el;
+      }
     }
+    return null;
   }
 
-  function getSearchResultRelevance(title, normalizedQuery) {
-    const normalizedTitle = normalize(title);
-    let score = 0;
-    if (normalizedTitle === normalizedQuery) score += 1000;
-    else if (normalizedTitle.startsWith(normalizedQuery)) score += 500;
-    else if (normalizedTitle.includes(` ${normalizedQuery}`)) score += 200;
+  function parseQuizTimerValue(el) {
+    if (!el) return null;
+    const text = (el.textContent || "").trim().replace(",", ".");
+    if (!text) return null;
 
-    if (/\b(?:ova|oav|special|recap|movie|film)\b/i.test(title)) {
-      score -= 1000;
+    const clock = text.match(/^(\d+):(\d+(?:\.\d+)?)$/);
+    if (clock) {
+      const total = parseInt(clock[1], 10) * 60 + parseFloat(clock[2]);
+      return Number.isFinite(total) ? total : null;
     }
-    return score - normalizedTitle.length;
+    const match = text.match(/\d+(?:\.\d+)?/);
+    if (!match) return null;
+    const value = parseFloat(match[0]);
+    return Number.isFinite(value) ? value : null;
   }
 
-  function search(rawQuery, currentRequest) {
-    const titleIndex = getAmqTitleIndex();
-    if (!titleIndex?.size) {
-      showNotice("Список названий AMQ пока недоступен.");
+  function performAutoSubmit() {
+    const input = getInput();
+    if (!input) return;
+    const inputValue = input.value.trim();
+    if (!inputValue) return;
+
+    let bestMatch = null;
+
+    if (pendingManualSelection && pendingManualSelection.amqValue === inputValue) {
+      bestMatch = pendingManualSelection;
+    } else if (/[а-яё]/i.test(inputValue)) {
+      if (keyboardIndex >= 0 && currentResults[keyboardIndex]) {
+        bestMatch = currentResults[keyboardIndex];
+      } else if (Array.isArray(currentResults) && currentResults.length > 0) {
+        bestMatch = currentResults[0];
+      } else if (Array.isArray(lastKnownResults) && lastKnownResults.length > 0) {
+        bestMatch = lastKnownResults[0];
+      }
+    } else {
       return;
     }
-    const accumulatedResults = new Map();
-    const addResults = animes => {
-      if (!Array.isArray(animes) || !animes.length) return;
-      for (const anime of animes) {
-        if (!anime?.russian || !anime?.name) continue;
-        const key = anime.malId
-          ? `mal:${anime.malId}`
-          : `${normalizeAmqTitle(anime.russian)}\u0000${normalizeAmqTitle(anime.name)}`;
-        const current = accumulatedResults.get(key);
-        if (!current || (!current.preferredTitle && anime.preferredTitle)) {
-          accumulatedResults.set(key, anime);
-        }
+
+    if (!bestMatch || !bestMatch.amqValue) return;
+
+    input.value = bestMatch.amqValue;
+    const answerInput = unsafeWindow.quiz?.answerInput;
+    if (answerInput && typeof answerInput.submitAnswer === "function") {
+      try {
+        answerInput.submitAnswer(true);
+      } catch (error) {
+        console.error("[AMQ Russian Dropdown] Auto-submit failed:", error);
       }
-      renderSearchResults(
-        [...accumulatedResults.values()],
-        rawQuery,
-        currentRequest,
-        titleIndex
-      );
-    };
-    requestSearchCandidates(rawQuery, databaseResults => {
-      addResults(databaseResults);
-    })
-      .then(animes => {
-        addResults(animes);
-      })
-      .catch(error => {
-        if (
-          currentRequest === requestId &&
-          accumulatedResults.size === 0 &&
-          currentResults.length === 0
-        ) {
-          showNotice(`Ошибка поиска: ${error.message}`);
-        }
-      });
+    }
   }
 
   document.addEventListener(
@@ -1749,13 +1619,15 @@
   scrollbarThumb.addEventListener("pointercancel", stopDragging);
   viewport.addEventListener("scroll", updateScrollbar);
 
-  document.addEventListener(
+  window.addEventListener(
     "keydown",
     event => {
-      if (!event.target.matches("#qpAnswerInput")) return;
-      if (panel.style.display === "none") return;
+      const input = getInput();
+      if (!input || document.activeElement !== input) return;
+      if (panel.style.display !== "block") return;
       const buttons = viewport.querySelectorAll("button[data-result-index]");
       if (!buttons.length) return;
+
       if (event.key === "ArrowDown") {
         event.preventDefault();
         event.stopImmediatePropagation();
@@ -1765,23 +1637,48 @@
         event.stopImmediatePropagation();
         setKeyboardIndex(keyboardIndex < 0 ? 0 : keyboardIndex - 1);
       } else if (event.key === "Enter") {
-        event.preventDefault();
-        event.stopImmediatePropagation();
         if (event.repeat) return;
-        const selectedIndex = keyboardIndex >= 0 ? keyboardIndex : 0;
-        const result = currentResults[selectedIndex];
-        if (result) submitSelectedTitleAndSkip(result);
+
+        if (keyboardIndex >= 0 && currentResults[keyboardIndex]) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          submitSelectedTitleAndSkip(currentResults[keyboardIndex]);
+          return;
+        }
+
+        const result = currentResults[0];
+        if (result) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          submitSelectedTitleAndSkip(result);
+        }
       }
     },
     true
   );
 
+  function clearStaleResults() {
+    panel.style.display = "none";
+    keyboardIndex = -1;
+    mouseIndex = -1;
+    currentResults = [];
+  }
+
   document.addEventListener("input", event => {
     if (!event.target.matches("#qpAnswerInput")) return;
     clearTimeout(debounceTimer);
-    
+
+    pendingManualSelection = null;
+
     const rawQuery = event.target.value;
     const query = rawQuery.trim();
+
+    if (query.length > 0 && !/[а-яё]/i.test(query)) {
+      hidePanel();
+      return;
+    }
+
+    const isDeleting = lastRawQuery.length > rawQuery.length;
 
     const isRelated =
       query.length > 0 &&
@@ -1790,6 +1687,8 @@
 
     if (!isRelated) {
       hidePanel();
+    } else if (isDeleting) {
+      clearStaleResults();
     } else if (currentResults.length > 0) {
       const matchingResults = currentResults.filter(r =>
         findTitleMatches(r.russian, rawQuery)
@@ -1798,9 +1697,7 @@
       if (matchingResults.length > 0) {
         showResults(matchingResults, rawQuery);
       } else {
-        panel.style.display = "none";
-        keyboardIndex = -1;
-        mouseIndex = -1;
+        clearStaleResults();
       }
     }
 
@@ -1808,7 +1705,7 @@
     lastRawQuery = rawQuery;
     const currentRequest = ++requestId;
 
-    if (query.length < 2 || !/[а-яё]/i.test(query)) return;
+    if (query.length < 2) return;
     debounceTimer = setTimeout(() => {
       search(rawQuery, currentRequest);
     }, SEARCH_DEBOUNCE_MS);
@@ -1826,6 +1723,72 @@
   window.addEventListener("resize", positionPanel);
   window.addEventListener("scroll", positionPanel, true);
 
+  let autoSubmitArmed = false;
+  let autoSubmitTimeout = null;
+
+  setInterval(() => {
+    const timerEl = getQuizTimerElement();
+
+    if (!timerEl) {
+      if (autoSubmitArmed) {
+        autoSubmitArmed = false;
+        if (autoSubmitTimeout) {
+          clearTimeout(autoSubmitTimeout);
+          autoSubmitTimeout = null;
+        }
+        performAutoSubmit();
+      }
+      return;
+    }
+
+    const time = parseQuizTimerValue(timerEl);
+    if (time === null) return;
+
+    if (time > 0 && time <= 3) {
+      const input = getInput();
+      if (input) {
+        const value = input.value;
+        const trimmed = value.trim();
+        if (trimmed && /[а-яё]/i.test(trimmed)) {
+          const sameQuery =
+            normalizeAmqTitle(trimmed) === normalizeAmqTitle(lastRawQuery);
+          const noResults =
+            lastKnownResults.length === 0 && currentResults.length === 0;
+          if (!sameQuery || noResults) {
+            clearTimeout(debounceTimer);
+            lastQuery = trimmed;
+            lastRawQuery = value;
+            const currentRequest = ++requestId;
+            search(value, currentRequest);
+          }
+        }
+      }
+    }
+
+    if (time > 0 && time <= 1 && !autoSubmitArmed) {
+      autoSubmitArmed = true;
+      const waitMs = Math.max(0, Math.round((time - 0.1) * 1000));
+      if (autoSubmitTimeout) clearTimeout(autoSubmitTimeout);
+      autoSubmitTimeout = setTimeout(() => {
+        autoSubmitTimeout = null;
+        autoSubmitArmed = false;
+        const freshEl = getQuizTimerElement();
+        const freshTime = freshEl ? parseQuizTimerValue(freshEl) : null;
+        if (freshTime === null || freshTime <= 1) {
+          performAutoSubmit();
+        }
+      }, waitMs);
+    }
+
+    if (time > 2 && autoSubmitArmed) {
+      autoSubmitArmed = false;
+      if (autoSubmitTimeout) {
+        clearTimeout(autoSubmitTimeout);
+        autoSubmitTimeout = null;
+      }
+    }
+  }, 50);
+
   let listenerAttempts = 0;
   const answerTitleListenerInterval = setInterval(() => {
     listenerAttempts++;
@@ -1838,6 +1801,7 @@
     }
     if (typeof Listener !== "function") return;
     if (!document.querySelector("#loadingScreen.hidden")) return;
+
     const listenerReady = setupAnswerRussianTitleListener();
     const multipleChoiceReady = setupMultipleChoiceTitleTranslation();
     updateSongHistoryRussianTitles();
@@ -1845,7 +1809,7 @@
       clearInterval(answerTitleListenerInterval);
     }
   }, 500);
-  
+
   let songHistoryUpdateFrame = 0;
   const songHistoryObserver = new MutationObserver(records => {
     const isGeneratedNode = node =>
@@ -1854,10 +1818,10 @@
         node.matches("#shiAnimeRussianTitle, [data-amq-russian-alias], [data-amq-russian-title]") ||
         node.querySelector("#shiAnimeRussianTitle, [data-amq-russian-alias], [data-amq-russian-title]")
       );
-      
+
     const isRelevantChange = records.some(record => {
-      if (record.target.nodeType === Node.ELEMENT_NODE && 
-          (record.target.matches("#shiAnimeRussianTitle, [data-amq-russian-alias], [data-amq-russian-title]") || 
+      if (record.target.nodeType === Node.ELEMENT_NODE &&
+          (record.target.matches("#shiAnimeRussianTitle, [data-amq-russian-alias], [data-amq-russian-title]") ||
            record.target.closest("#shiAnimeRussianTitle, [data-amq-russian-alias], [data-amq-russian-title]"))) {
         return false;
       }
@@ -1866,14 +1830,14 @@
       }
       return [...record.addedNodes].some(node => !isGeneratedNode(node));
     });
-    
+
     if (!isRelevantChange || songHistoryUpdateFrame) return;
     songHistoryUpdateFrame = requestAnimationFrame(() => {
       songHistoryUpdateFrame = 0;
       updateSongHistoryRussianTitles();
     });
   });
-  
+
   songHistoryObserver.observe(document.body, {
     childList: true,
     subtree: true,
