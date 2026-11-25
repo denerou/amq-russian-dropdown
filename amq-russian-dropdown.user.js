@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AMQ Russian Dropdown
-// @version      4.0
-// @description  
+// @version      4.0.1
+// @description
 // @author       denero
 // @match        https://animemusicquiz.com/*
 // @match        https://www.animemusicquiz.com/*
@@ -403,6 +403,7 @@
     ) {
       return amqTitlesCache;
     }
+
     const list =
       unsafeWindow.quiz?.answerInput?.typingInput?.autoCompleteController?.list;
     if (!Array.isArray(list) || !list.length) return [];
@@ -957,7 +958,7 @@
         getAmqTitleMatchForAnime(anime) ||
         exactStringMatch ||
         getExactAmqTitleIndex()?.get(normalizeAmqTitle(anime.name)) ||
-        titleIndex.get(normalize(anime.name)) ||
+        titleIndex?.get(normalize(anime.name)) || // Добавлен безопасный вызов
         { value: anime.name, label: anime.name };
 
       matchedResults.push({
@@ -1015,10 +1016,6 @@
 
   function search(rawQuery, currentRequest) {
     const titleIndex = getAmqTitleIndex();
-    if (!titleIndex?.size) {
-      showNotice("Список названий AMQ пока недоступен.");
-      return;
-    }
     const accumulatedResults = new Map();
     const addResults = animes => {
       if (!Array.isArray(animes) || !animes.length) return;
