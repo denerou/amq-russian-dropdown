@@ -958,7 +958,7 @@
         getAmqTitleMatchForAnime(anime) ||
         exactStringMatch ||
         getExactAmqTitleIndex()?.get(normalizeAmqTitle(anime.name)) ||
-        titleIndex?.get(normalize(anime.name)) || // Добавлен безопасный вызов
+        titleIndex?.get(normalize(anime.name)) ||
         { value: anime.name, label: anime.name };
 
       matchedResults.push({
